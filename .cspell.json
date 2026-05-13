@@ -34,7 +34,10 @@
     "backdoors",
     "metacharacters",
     "metacharacter",
-    "Blocklist"
+    "Blocklist",
+    "splitlines",
+    "tomllib",
+    "uvicorn"
   ],
   "ignorePaths": [
     "**/node_modules/**",
