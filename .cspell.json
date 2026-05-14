@@ -37,7 +37,11 @@
     "Blocklist",
     "splitlines",
     "tomllib",
-    "uvicorn"
+    "uvicorn",
+    "tomli",
+    "fastapi",
+    "structlog",
+    "scipy"
   ],
   "ignorePaths": [
     "**/node_modules/**",
