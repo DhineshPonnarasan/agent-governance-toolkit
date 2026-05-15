@@ -41,7 +41,8 @@
     "tomli",
     "fastapi",
     "structlog",
-    "scipy"
+    "scipy",
+    "croniter"
   ],
   "ignorePaths": [
     "**/node_modules/**",
