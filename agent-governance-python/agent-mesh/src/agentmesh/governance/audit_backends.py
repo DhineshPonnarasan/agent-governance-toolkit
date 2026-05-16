@@ -13,6 +13,7 @@ import hashlib
 import hmac
 import json
 import os
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
@@ -81,6 +82,12 @@ class SignedAuditEntry(BaseModel):
     trace_id: Optional[str] = None
     session_id: Optional[str] = None
 
+    # Execution-context enrichment — stored for observability; excluded from
+    # ``_canonical_payload()`` so that existing HMAC chains remain verifiable.
+    sandbox_id: Optional[str] = None
+    environment: Optional[str] = None
+    compute_driver: Optional[str] = None
+
     # Integrity fields
     content_hash: str = ""
     previous_hash: str = ""
@@ -119,6 +126,9 @@ class SignedAuditEntry(BaseModel):
             matched_rule=entry.matched_rule,
             trace_id=entry.trace_id,
             session_id=entry.session_id,
+            sandbox_id=entry.sandbox_id,
+            environment=entry.environment,
+            compute_driver=entry.compute_driver,
             previous_hash=previous_hash,
         )
 
@@ -135,6 +145,10 @@ class SignedAuditEntry(BaseModel):
 
         Excludes ``content_hash`` and ``signature`` so they can be
         recomputed during verification.
+
+        Also excludes execution-context fields (``sandbox_id``,
+        ``environment``, ``compute_driver``) so that they can be added
+        to entries without invalidating existing HMAC chains.
         """
         payload: dict[str, Any] = {
             "entry_id": self.entry_id,
@@ -399,3 +413,102 @@ class HashChainVerifier:
             previous_hash = entry.content_hash
 
         return (len(errors) == 0), errors
+
+
+# ---------------------------------------------------------------------------
+# StdoutAuditSink
+# ---------------------------------------------------------------------------
+
+
+class StdoutAuditSink:
+    """Audit sink that emits one JSON object per line (JSONL) to stdout.
+
+    Designed for containerised deployments where log aggregation systems
+    (Kubernetes, Docker, OpenShell, sidecar shippers, ``jq`` pipelines)
+    consume structured JSON from process stdout.
+
+    Properties:
+    * One valid JSON object per line — never split across lines.
+    * UTF-8 safe: non-ASCII characters are included verbatim (not escaped).
+    * Flushed after every :meth:`write` and after every :meth:`write_batch`.
+    * Thread-safe: a per-instance lock serialises concurrent writes.
+    * No ANSI formatting, no pretty-printing, no extra timestamps.
+    * No signing or chain verification — use :class:`FileAuditSink` when
+      cryptographic integrity is required.
+
+    The JSON schema matches :class:`AuditEntry` (Pydantic ``model_dump``
+    with ``mode="json"``), which includes the optional execution-context
+    fields (``sandbox_id``, ``environment``, ``compute_driver``) when
+    present.
+
+    Example::
+
+        sink = StdoutAuditSink()
+        log = AuditLog(sink=sink)
+        log.log(event_type="tool_invocation", agent_did="did:web:a1", action="read")
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+
+    def write(self, entry: AuditEntry) -> None:
+        """Serialise *entry* to JSONL and write it to stdout.
+
+        The output stream is flushed immediately after the write so that
+        container log drivers observe the line without buffering delay.
+        """
+        line = self._serialise(entry)
+        with self._lock:
+            sys.stdout.write(line + "\n")
+            sys.stdout.flush()
+
+    def write_batch(self, entries: list[AuditEntry]) -> None:
+        """Serialise all entries and write them to stdout under a single lock.
+
+        All lines are serialised before the lock is acquired, then
+        written in a single :meth:`str.write` call so the batch is as
+        atomic as possible, followed by one flush.
+        """
+        if not entries:
+            return
+        # Serialise outside the lock — pure CPU work, no I/O.
+        block = "".join(self._serialise(e) + "\n" for e in entries)
+        with self._lock:
+            sys.stdout.write(block)
+            sys.stdout.flush()
+
+    def verify_integrity(self) -> tuple[bool, str | None]:
+        """Stdout is a streaming sink; integrity verification is not supported.
+
+        Returns ``(True, None)`` — no integrity violations are known.
+        Callers that require verifiable audit trails should use
+        :class:`FileAuditSink`.
+        """
+        return True, None
+
+    def close(self) -> None:
+        """Flush stdout.  Does NOT close the underlying stream."""
+        with self._lock:
+            sys.stdout.flush()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _serialise(entry: AuditEntry) -> str:
+        """Return a compact, sorted JSON string for *entry*.
+
+        Uses Pydantic's ``model_dump(mode="json")`` so that datetime
+        values are rendered as ISO-8601 strings without needing a custom
+        ``default`` handler, matching the serialisation contract of the
+        rest of the audit subsystem.
+
+        ``ensure_ascii=False`` preserves non-ASCII characters verbatim
+        (e.g. CJK, emoji, accented characters) rather than escaping them
+        to ``\\uXXXX`` sequences, producing more compact and readable output
+        in container log aggregators.  Container runtimes expose UTF-8
+        stdout by default; callers in non-UTF-8 environments should set
+        ``PYTHONIOENCODING=utf-8`` or ``PYTHONUTF8=1``.
+        """
+        return json.dumps(entry.model_dump(mode="json"), sort_keys=True, ensure_ascii=False)

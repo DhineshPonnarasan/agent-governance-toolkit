@@ -9,6 +9,8 @@ Entries added via AuditLog or MerkleAuditChain get automatic hash chaining.
 
 from __future__ import annotations
 
+import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Optional, Any
 from pydantic import BaseModel, Field
@@ -18,6 +20,37 @@ import uuid
 
 if TYPE_CHECKING:
     from .audit_backends import AuditSink
+
+
+@dataclass(frozen=True)
+class _EnvContext:
+    """Immutable snapshot of execution-environment context captured at AuditLog init."""
+
+    sandbox_id: Optional[str]
+    environment: Optional[str]
+    compute_driver: Optional[str]
+
+
+def _capture_env_context() -> _EnvContext:
+    """Read execution-environment variables once and return an immutable snapshot.
+
+    Resolution rules:
+    * ``sandbox_id``: prefers ``SANDBOX_ID``; falls back to ``OPENSHELL_SANDBOX_ID``.
+    * ``environment``: reads ``AGT_ENVIRONMENT``.
+    * ``compute_driver``: reads ``OPENSHELL_COMPUTE_DRIVER``.
+
+    Empty strings are treated as absent (``None``).
+    """
+    sandbox_id: Optional[str] = (
+        os.getenv("SANDBOX_ID") or os.getenv("OPENSHELL_SANDBOX_ID") or None
+    )
+    environment: Optional[str] = os.getenv("AGT_ENVIRONMENT") or None
+    compute_driver: Optional[str] = os.getenv("OPENSHELL_COMPUTE_DRIVER") or None
+    return _EnvContext(
+        sandbox_id=sandbox_id,
+        environment=environment,
+        compute_driver=compute_driver,
+    )
 
 
 class AuditEntry(BaseModel):
@@ -58,6 +91,11 @@ class AuditEntry(BaseModel):
     # Metadata
     trace_id: Optional[str] = None
     session_id: Optional[str] = None
+
+    # Execution-context enrichment (optional; not included in integrity hash)
+    sandbox_id: Optional[str] = None
+    environment: Optional[str] = None
+    compute_driver: Optional[str] = None
 
     def compute_hash(self) -> str:
         """Compute the SHA-256 hash of this entry's canonical fields.
@@ -362,6 +400,8 @@ class AuditLog:
         self._by_agent: dict[str, list[str]] = {}
         self._by_type: dict[str, list[str]] = {}
         self._sink = sink
+        # Capture environment context once at init; never re-read per-entry.
+        self._env_context: _EnvContext = _capture_env_context()
 
     def log(
         self,
@@ -384,6 +424,9 @@ class AuditLog:
             outcome=outcome,
             policy_decision=policy_decision,
             trace_id=trace_id,
+            sandbox_id=self._env_context.sandbox_id,
+            environment=self._env_context.environment,
+            compute_driver=self._env_context.compute_driver,
         )
 
         self._chain.add_entry(entry)
