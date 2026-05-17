@@ -388,14 +388,14 @@ class TestAuditEntryContextFields:
         assert rec["environment"] == "staging"
         assert rec["container_runtime"] == "containerd"
 
-    def test_missing_context_fields_appear_as_null_in_stdout(self):
+    def test_missing_context_fields_omitted_from_stdout(self):
         entry = _make_entry()
         sink = StdoutAuditSink()
         records = _capture_stdout(sink, lambda s: s.write(entry))
         rec = records[0]
-        assert rec["sandbox_id"] is None
-        assert rec["environment"] is None
-        assert rec["container_runtime"] is None
+        assert "sandbox_id" not in rec
+        assert "environment" not in rec
+        assert "container_runtime" not in rec
 
 
 # ---------------------------------------------------------------------------

@@ -517,5 +517,9 @@ class StdoutAuditSink:
         in container log aggregators.  Container runtimes expose UTF-8
         stdout by default; callers in non-UTF-8 environments should set
         ``PYTHONIOENCODING=utf-8`` or ``PYTHONUTF8=1``.
+
+        ``exclude_none=True`` omits optional fields whose value is ``None``
+        so that records without execution-context fields stay compact and
+        do not break downstream parsers with strict schemas.
         """
-        return json.dumps(entry.model_dump(mode="json"), sort_keys=True, ensure_ascii=False)
+        return json.dumps(entry.model_dump(mode="json", exclude_none=True), sort_keys=True, ensure_ascii=False)
