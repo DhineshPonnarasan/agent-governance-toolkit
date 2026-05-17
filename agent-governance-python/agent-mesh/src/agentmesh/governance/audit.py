@@ -28,28 +28,28 @@ class _EnvContext:
 
     sandbox_id: Optional[str]
     environment: Optional[str]
-    compute_driver: Optional[str]
+    container_runtime: Optional[str]
 
 
 def _capture_env_context() -> _EnvContext:
     """Read execution-environment variables once and return an immutable snapshot.
 
     Resolution rules:
-    * ``sandbox_id``: prefers ``SANDBOX_ID``; falls back to ``OPENSHELL_SANDBOX_ID``.
+    * ``sandbox_id``: prefers ``OPENSHELL_SANDBOX_ID``; falls back to bare ``SANDBOX_ID``.
     * ``environment``: reads ``AGT_ENVIRONMENT``.
-    * ``compute_driver``: reads ``OPENSHELL_COMPUTE_DRIVER``.
+    * ``container_runtime``: reads ``OPENSHELL_CONTAINER_RUNTIME``.
 
     Empty strings are treated as absent (``None``).
     """
     sandbox_id: Optional[str] = (
-        os.getenv("SANDBOX_ID") or os.getenv("OPENSHELL_SANDBOX_ID") or None
+        os.getenv("OPENSHELL_SANDBOX_ID") or os.getenv("SANDBOX_ID") or None
     )
     environment: Optional[str] = os.getenv("AGT_ENVIRONMENT") or None
-    compute_driver: Optional[str] = os.getenv("OPENSHELL_COMPUTE_DRIVER") or None
+    container_runtime: Optional[str] = os.getenv("OPENSHELL_CONTAINER_RUNTIME") or None
     return _EnvContext(
         sandbox_id=sandbox_id,
         environment=environment,
-        compute_driver=compute_driver,
+        container_runtime=container_runtime,
     )
 
 
@@ -95,7 +95,7 @@ class AuditEntry(BaseModel):
     # Execution-context enrichment (optional; not included in integrity hash)
     sandbox_id: Optional[str] = None
     environment: Optional[str] = None
-    compute_driver: Optional[str] = None
+    container_runtime: Optional[str] = None
 
     def compute_hash(self) -> str:
         """Compute the SHA-256 hash of this entry's canonical fields.
@@ -426,7 +426,7 @@ class AuditLog:
             trace_id=trace_id,
             sandbox_id=self._env_context.sandbox_id,
             environment=self._env_context.environment,
-            compute_driver=self._env_context.compute_driver,
+            container_runtime=self._env_context.container_runtime,
         )
 
         self._chain.add_entry(entry)
