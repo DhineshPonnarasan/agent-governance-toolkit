@@ -1,5 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
+# ruff: noqa: E402 — deprecation warning must fire before re-exports
 """
 Agent OS - A Safety-First Kernel for Autonomous AI Agents
 
@@ -44,7 +45,17 @@ Installation:
     pip install agent-os-kernel        # Core
 """
 
+
 from __future__ import annotations
+
+import warnings as _warnings
+_warnings.warn(
+    "agent-os-kernel is deprecated. Use agent-governance-toolkit-core instead. "
+    "See https://github.com/microsoft/agent-governance-toolkit/blob/main/docs/package-consolidation/MIGRATION.md",
+    DeprecationWarning,
+    stacklevel=2,
+)
+del _warnings
 
 __version__ = "3.2.2"
 __author__ = "Microsoft Corporation"
@@ -181,6 +192,23 @@ from agent_os.mcp_security import (
     ToolFingerprint,
 )
 from agent_os.credential_redactor import CredentialMatch, CredentialPattern, CredentialRedactor
+from agent_os.credential_vault import (
+    DENY_REASON,
+    CredentialDecision,
+    CredentialError,
+    CredentialHandle,
+    CredentialInjector,
+    CredentialProfile,
+    CredentialRecord,
+    CredentialVault,
+    DenyReceipt,
+    EncryptionUnavailable,
+    InjectionContext,
+    InjectionResult,
+    PolicyOutcome,
+    VaultAuditEvent,
+    audit_digest,
+)
 from agent_os.mcp_message_signer import (
     MCPMessageSigner,
     MCPSignedEnvelope,
@@ -336,6 +364,22 @@ __all__ = [
     "CredentialRedactor",
     "CredentialPattern",
     "CredentialMatch",
+    # Credential Vault & Injection (issue #2481)
+    "CredentialVault",
+    "CredentialInjector",
+    "CredentialHandle",
+    "CredentialProfile",
+    "CredentialRecord",
+    "CredentialDecision",
+    "CredentialError",
+    "EncryptionUnavailable",
+    "VaultAuditEvent",
+    "DenyReceipt",
+    "InjectionContext",
+    "InjectionResult",
+    "PolicyOutcome",
+    "DENY_REASON",
+    "audit_digest",
     "MCPSessionStore",
     "MCPNonceStore",
     "MCPRateLimitStore",

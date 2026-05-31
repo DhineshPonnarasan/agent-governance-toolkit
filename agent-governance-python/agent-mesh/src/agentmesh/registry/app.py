@@ -13,7 +13,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from agentmesh.registry.store import AgentRecord, InMemoryRegistryStore, RegistryStore
@@ -31,8 +31,9 @@ def _utcnow() -> datetime:
 
 
 class RegisterAgentRequest(BaseModel):
-    did: str
-    public_key: str  # base64url
+    public_key: str  # base64url, Ed25519 (32 bytes)
+    proof: str  # base64url Ed25519 signature over (public_key || proof_timestamp)
+    proof_timestamp: str  # ISO 8601 UTC timestamp signed in the proof
     capabilities: list[str] = Field(default_factory=list)
     metadata: dict[str, str] = Field(default_factory=dict)
 
@@ -98,6 +99,10 @@ def verify_ed25519_timestamp_auth(
         ts = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
     except ValueError:
         raise HTTPException(status_code=401, detail="Invalid timestamp format")
+    # Reject TZ-naive timestamps explicitly to avoid a 500 from the
+    # ``now - ts`` subtraction below.
+    if ts.tzinfo is None:
+        raise HTTPException(status_code=401, detail="Timestamp must include timezone offset")
 
     now = _utcnow()
     if abs((now - ts).total_seconds()) > REPLAY_WINDOW.total_seconds():
@@ -152,27 +157,54 @@ class RegistryServer:
 
         @app.post("/v1/agents", status_code=201)
         async def register_agent(req: RegisterAgentRequest) -> dict:
-            """Register a new agent."""
-            if store.get_agent(req.did):
-                raise HTTPException(status_code=409, detail="Agent already registered")
+            """Register a new agent with proof-of-possession."""
+            import hashlib
 
+            from nacl.exceptions import BadSignatureError
+            from nacl.signing import VerifyKey
+
+            # Decode and validate public key
             try:
                 public_key = base64.urlsafe_b64decode(req.public_key + "==")
             except Exception:
                 raise HTTPException(status_code=400, detail="Invalid public_key encoding")
-
             if len(public_key) != 32:
                 raise HTTPException(status_code=400, detail="public_key must be 32 bytes")
 
+            # Verify proof timestamp is within replay window
+            try:
+                ts = datetime.fromisoformat(req.proof_timestamp)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=400, detail="Invalid proof_timestamp")
+            if abs((_utcnow() - ts).total_seconds()) > REPLAY_WINDOW.total_seconds():
+                raise HTTPException(status_code=401, detail="Proof timestamp outside replay window")
+
+            # Verify proof-of-possession: signature over (public_key || proof_timestamp)
+            try:
+                proof_bytes = base64.urlsafe_b64decode(req.proof + "==")
+                message = req.public_key.encode() + req.proof_timestamp.encode()
+                VerifyKey(public_key).verify(message, proof_bytes)
+            except BadSignatureError:
+                raise HTTPException(status_code=401, detail="Invalid proof-of-possession")
+            except Exception:
+                raise HTTPException(status_code=400, detail="Malformed proof")
+
+            # Derive DID deterministically from public key hash
+            key_hash = hashlib.sha256(public_key).hexdigest()[:32]
+            did = f"did:mesh:{key_hash}"
+
+            if store.get_agent(did):
+                raise HTTPException(status_code=409, detail="Agent already registered")
+
             record = AgentRecord(
-                did=req.did,
+                did=did,
                 public_key=public_key,
                 capabilities=req.capabilities,
                 metadata=req.metadata,
             )
             store.put_agent(record)
-            logger.info("Registered agent %s", req.did)
-            return {"did": req.did, "status": "registered"}
+            logger.info("Registered agent %s", did)
+            return {"did": did, "status": "registered"}
 
         @app.get("/v1/agents/{did}")
         async def get_agent(did: str) -> dict:
@@ -190,8 +222,19 @@ class RegistryServer:
             }
 
         @app.delete("/v1/agents/{did}", status_code=204)
-        async def deregister_agent(did: str) -> None:
-            """Deregister an agent."""
+        async def deregister_agent(
+            did: str,
+            authorization: str = Header(..., alias="Authorization"),
+        ) -> None:
+            """Deregister an agent.
+
+            Requires Ed25519-Timestamp auth and the caller's DID must
+            match the DID being deregistered — only the holder of the
+            corresponding private key can remove a registration.
+            """
+            authed_did = verify_ed25519_timestamp_auth(authorization, store)
+            if authed_did != did:
+                raise HTTPException(status_code=403, detail="DID mismatch")
             if not store.delete_agent(did):
                 raise HTTPException(status_code=404, detail="Agent not found")
             logger.info("Deregistered agent %s", did)
@@ -199,11 +242,20 @@ class RegistryServer:
         # ── Pre-Keys ─────────────────────────────────────────────
 
         @app.put("/v1/agents/{did}/prekeys")
-        async def upload_prekeys(did: str, req: PreKeyBundleRequest) -> dict:
-            """Upload a pre-key bundle."""
+        async def upload_prekeys(
+            did: str,
+            req: PreKeyBundleRequest,
+            authorization: str = Header(..., alias="Authorization"),
+        ) -> dict:
+            """Upload a pre-key bundle. Requires Ed25519-Timestamp auth."""
             agent = store.get_agent(did)
             if not agent:
                 raise HTTPException(status_code=404, detail="Agent not found")
+
+            # Verify the caller owns this DID via Ed25519-Timestamp auth
+            authed_did = verify_ed25519_timestamp_auth(authorization, store)
+            if authed_did != did:
+                raise HTTPException(status_code=403, detail="DID mismatch")
 
             try:
                 agent.identity_key = base64.urlsafe_b64decode(req.identity_key + "==")
@@ -272,12 +324,26 @@ class RegistryServer:
             }
 
         @app.post("/v1/agents/{did}/heartbeat")
-        async def heartbeat(did: str) -> dict:
+        async def heartbeat(
+            did: str,
+            authorization: str | None = Header(None, alias="Authorization"),
+        ) -> dict:
             """Bump an agent's `last_seen` to keep it visible in presence
             checks. Rate-limited to at most once per 10 seconds per agent
             to prevent abuse (attacker keeping stale agents permanently
             online). Returns 429 when throttled without updating last_seen.
+
+            Authentication: required. The caller must present an
+            ``Ed25519-Timestamp`` header signed by ``did``. Without this,
+            any unauthenticated party could keep an offline agent's
+            presence record live (impersonation / DoS-mask).
             """
+            authed_did = verify_ed25519_timestamp_auth(authorization, store)
+            if authed_did != did:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Authenticated DID does not match heartbeat target",
+                )
             if not store.get_agent(did):
                 raise HTTPException(status_code=404, detail="Agent not found")
             if not store.try_update_last_seen(did, min_interval_seconds=10.0):
@@ -294,8 +360,24 @@ class RegistryServer:
         # ── Reputation ───────────────────────────────────────────
 
         @app.post("/v1/agents/{did}/reputation")
-        async def submit_reputation(did: str, req: ReputationRequest) -> dict:
-            """Submit reputation feedback for an agent."""
+        async def submit_reputation(
+            did: str,
+            req: ReputationRequest,
+            authorization: str | None = Header(None, alias="Authorization"),
+        ) -> dict:
+            """Submit reputation feedback for an agent.
+
+            Authentication: required. The caller must present an
+            ``Ed25519-Timestamp`` header so the reporter is bound to an
+            authenticated identity. Self-reporting is rejected — agents
+            cannot inflate their own reputation.
+            """
+            authed_did = verify_ed25519_timestamp_auth(authorization, store)
+            if authed_did == did:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Agents may not submit reputation about themselves",
+                )
             agent = store.get_agent(did)
             if not agent:
                 raise HTTPException(status_code=404, detail="Agent not found")
@@ -307,7 +389,10 @@ class RegistryServer:
             return {"did": did, "reputation_score": round(agent.reputation_score, 4)}
 
         @app.post("/v1/registry/reputation/session")
-        async def submit_session_reputation(req: SessionReputationRequest) -> dict:
+        async def submit_session_reputation(
+            req: SessionReputationRequest,
+            authorization: str | None = Header(None, alias="Authorization"),
+        ) -> dict:
             """Record a session outcome and update both endpoints' reputation.
 
             Outcome mapping (EMA, alpha=0.2):
@@ -316,8 +401,20 @@ class RegistryServer:
               - timeout → score 0.2 toward the receiver (initiator unchanged)
 
             Missing agents are silently skipped (best-effort telemetry).
-            The reporter must be a registered agent (either initiator or receiver).
+
+            Authentication: required. The caller must present an
+            ``Ed25519-Timestamp`` header and the authenticated DID MUST
+            equal ``reporter_amid``. Additionally, the reporter must be
+            a session participant (initiator or receiver). Together this
+            stops any party — authenticated or not — from forging session
+            telemetry as another agent.
             """
+            authed_did = verify_ed25519_timestamp_auth(authorization, store)
+            if authed_did != req.reporter_amid:
+                raise HTTPException(
+                    status_code=403,
+                    detail="reporter_amid does not match authenticated DID",
+                )
             # Validate reporter is a session participant
             if req.reporter_amid not in (req.initiator_amid, req.receiver_amid):
                 raise HTTPException(

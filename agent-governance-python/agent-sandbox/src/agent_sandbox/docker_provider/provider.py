@@ -4,7 +4,7 @@
 
 Each agent gets its own Docker container scoped to a session.  Containers
 are hardened by default: all capabilities dropped, ``no-new-privileges``,
-optional read-only root filesystem, non-root user, ``pids_limit=256``.
+optional read-only root filesystem, non-root user, ``pids_limit=128``.
 
 Policy-driven resource limits, tool proxies, and network proxies are set
 up at session creation time when a ``PolicyDocument`` is passed.
@@ -22,6 +22,8 @@ import time
 import uuid
 from typing import Any, Callable
 
+from agent_sandbox.code_scanner import enforce_no_subprocess_execution
+from agent_sandbox.docker_provider.state import SandboxCheckpoint, SandboxStateManager
 from agent_sandbox.isolation_runtime import IsolationRuntime
 from agent_sandbox.sandbox_provider import (
     ExecutionHandle,
@@ -32,7 +34,6 @@ from agent_sandbox.sandbox_provider import (
     SessionHandle,
     SessionStatus,
 )
-from agent_sandbox.docker_provider.state import SandboxCheckpoint, SandboxStateManager
 
 logger = logging.getLogger(__name__)
 
@@ -570,6 +571,8 @@ class DockerSandboxProvider(SandboxProvider):
                 raise PermissionError(
                     f"Policy denied: {decision.reason}"
                 )
+
+        enforce_no_subprocess_execution(code)
 
         # Run code with the session's configured timeout/env, not defaults.
         result = self.run(
