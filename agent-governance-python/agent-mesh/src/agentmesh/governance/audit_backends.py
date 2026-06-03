@@ -13,8 +13,9 @@ import hashlib
 import hmac
 import json
 import os
+import sys
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
@@ -81,6 +82,12 @@ class SignedAuditEntry(BaseModel):
     trace_id: Optional[str] = None
     session_id: Optional[str] = None
 
+    # Execution-context enrichment — stored for observability; excluded from
+    # ``_canonical_payload()`` so that existing HMAC chains remain verifiable.
+    sandbox_id: Optional[str] = None
+    environment: Optional[str] = None
+    compute_driver: Optional[str] = None
+
     # Integrity fields
     content_hash: str = ""
     previous_hash: str = ""
@@ -119,6 +126,9 @@ class SignedAuditEntry(BaseModel):
             matched_rule=entry.matched_rule,
             trace_id=entry.trace_id,
             session_id=entry.session_id,
+            sandbox_id=entry.sandbox_id,
+            environment=entry.environment,
+            compute_driver=entry.compute_driver,
             previous_hash=previous_hash,
         )
 
@@ -135,6 +145,10 @@ class SignedAuditEntry(BaseModel):
 
         Excludes ``content_hash`` and ``signature`` so they can be
         recomputed during verification.
+
+        Also excludes execution-context fields (``sandbox_id``,
+        ``environment``, ``compute_driver``) so that they can be added
+        to entries without invalidating existing HMAC chains.
         """
         payload: dict[str, Any] = {
             "entry_id": self.entry_id,
@@ -292,7 +306,7 @@ class FileAuditSink:
             return
         if self._path.stat().st_size >= self._max_file_size:
             rotated = self._path.with_suffix(
-                f".{datetime.utcnow().strftime('%Y%m%d%H%M%S')}.jsonl"
+                f".{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}.jsonl"
             )
             os.replace(self._path, rotated)
             # Reset chain for the new file
@@ -385,7 +399,7 @@ class HashChainVerifier:
 
             # Content hash
             expected_hash = entry._compute_content_hash()
-            if entry.content_hash != expected_hash:
+            if not hmac.compare_digest(entry.content_hash, expected_hash):
                 errors.append(
                     f"Entry {idx} ({entry.entry_id}): content hash mismatch"
                 )
@@ -399,3 +413,154 @@ class HashChainVerifier:
             previous_hash = entry.content_hash
 
         return (len(errors) == 0), errors
+
+
+# ---------------------------------------------------------------------------
+# StdoutAuditSink
+# ---------------------------------------------------------------------------
+
+
+class StdoutAuditSink:
+    """Audit sink that emits one JSON object per line (JSONL) to stdout.
+
+    Designed for containerised deployments where log aggregation systems
+    (Kubernetes, Docker, OpenShell, sidecar shippers, ``jq`` pipelines)
+    consume structured JSON from process stdout.
+
+    Properties:
+    * One valid JSON object per line -- never split across lines.
+    * UTF-8 safe: non-ASCII characters are included verbatim (not escaped).
+    * Flushed after every :meth:`write` and after every :meth:`write_batch`.
+    * Thread-safe: a **class-level** lock serialises all stdout writes
+      across every :class:`StdoutAuditSink` instance in the process.
+      Multiple instances therefore cannot interleave their output.
+    * No ANSI formatting, no pretty-printing, no extra timestamps.
+    * No signing or chain verification -- use :class:`FileAuditSink` when
+      cryptographic integrity is required.
+
+    The JSON schema matches :class:`AuditEntry` (Pydantic ``model_dump``
+    with ``mode="json"``), which includes the optional execution-context
+    fields (``sandbox_id``, ``environment``, ``compute_driver``) when
+    present.
+
+    Args:
+        stream: Output stream. Defaults to ``sys.stdout``.
+        include_context: Whether to include sandbox context fields
+            (sandbox_id, environment, compute_driver) in the output.
+            Defaults to ``True``.
+
+    Example::
+
+        sink = StdoutAuditSink()
+        log = AuditLog(sink=sink)
+        log.log(event_type="tool_invocation", agent_did="did:web:a1", action="read")
+    """
+
+    # Class-level lock -- shared across all instances so that concurrent
+    # writes from separate StdoutAuditSink objects cannot interleave on
+    # the process-global sys.stdout.
+    _stdout_lock: threading.Lock = threading.Lock()
+
+    def __init__(
+        self,
+        stream: Any = None,
+        *,
+        include_context: bool = True,
+    ) -> None:
+        self._stream = stream  # None means use sys.stdout at write time
+        self._include_context = include_context
+        self._closed = False
+
+    def write(self, entry: AuditEntry) -> None:
+        """Serialise *entry* to JSONL and write it to the output stream.
+
+        The output stream is flushed immediately after the write so that
+        container log drivers observe the line without buffering delay.
+        """
+        if self._closed:
+            return
+        line = self._serialize_entry(entry)
+        with self._stdout_lock:
+            out = self._stream if self._stream is not None else sys.stdout
+            out.write(line + "\n")
+            out.flush()
+
+    def write_batch(self, entries: list[AuditEntry]) -> None:
+        """Serialise all entries and write them under a single lock.
+
+        All lines are serialised before the lock is acquired, then
+        written in a single call so the batch is as atomic as possible,
+        followed by one flush.
+        """
+        if not entries or self._closed:
+            return
+        block = "".join(self._serialize_entry(e) + "\n" for e in entries)
+        with self._stdout_lock:
+            out = self._stream if self._stream is not None else sys.stdout
+            out.write(block)
+            out.flush()
+
+    def verify_integrity(self) -> tuple[bool, str | None]:
+        """Stdout is a streaming sink; integrity verification is not supported.
+
+        Returns (True, None) since stdout is write-only.
+        """
+        return True, None
+
+    def close(self) -> None:
+        """Flush the output stream. Does NOT close the underlying stream."""
+        self._closed = True
+        with self._stdout_lock:
+            out = self._stream if self._stream is not None else sys.stdout
+            out.flush()
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _serialize_entry(self, entry: AuditEntry) -> str:
+        """Return a compact, sorted JSON string for *entry*.
+
+        When include_context is True, uses Pydantic model_dump for full
+        fidelity. When False, manually constructs the dict excluding
+        sandbox context fields.
+        """
+        if self._include_context:
+            return json.dumps(
+                entry.model_dump(mode="json", exclude_none=True),
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+        # Exclude context fields when include_context=False
+        data: dict[str, Any] = {
+            "entry_id": entry.entry_id,
+            "timestamp": entry.timestamp.isoformat().replace("+00:00", "Z"),
+            "event_type": entry.event_type,
+            "agent_did": entry.agent_did,
+            "action": entry.action,
+            "outcome": entry.outcome,
+        }
+        if entry.resource is not None:
+            data["resource"] = entry.resource
+        if entry.target_did is not None:
+            data["target_did"] = entry.target_did
+        if entry.data:
+            data["data"] = entry.data
+        if entry.policy_decision is not None:
+            data["policy_decision"] = entry.policy_decision
+        if entry.matched_rule is not None:
+            data["matched_rule"] = entry.matched_rule
+        if entry.trace_id is not None:
+            data["trace_id"] = entry.trace_id
+        if entry.session_id is not None:
+            data["session_id"] = entry.session_id
+        return json.dumps(data, sort_keys=True, default=str)
+
+    @staticmethod
+    def _serialise(entry: AuditEntry) -> str:
+        """Return a compact, sorted JSON string (legacy static helper).
+
+        Uses Pydantic model_dump with exclude_none=True for full fidelity
+        serialisation including all context fields.
+        """
+        return json.dumps(entry.model_dump(mode="json", exclude_none=True), sort_keys=True, ensure_ascii=False)

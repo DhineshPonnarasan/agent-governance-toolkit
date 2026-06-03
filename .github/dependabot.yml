@@ -123,7 +123,31 @@ updates:
       - "dependencies"
 
   - package-ecosystem: "npm"
+    directory: "/agent-governance-copilot-cli"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+
+  - package-ecosystem: "npm"
+    directory: "/agent-governance-claude-code"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+
+  - package-ecosystem: "npm"
     directory: "/agent-governance-typescript"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+
+  - package-ecosystem: "npm"
+    directory: "/agent-governance-antigravity-cli"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5

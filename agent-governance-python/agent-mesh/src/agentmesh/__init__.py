@@ -1,5 +1,6 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
+# ruff: noqa: E402 — deprecation warning must fire before re-exports
 """
 AgentMesh - The Secure Nervous System for Cloud-Native Agent Ecosystems
 
@@ -8,10 +9,19 @@ Identity · Trust · Reward · Governance
 AgentMesh is the platform built for the Governed Agent Mesh - the cloud-native,
 multi-vendor network of AI agents that will define enterprise operations.
 
-Version: 1.0.0-alpha
+Version: 3.6.0
 """
 
-__version__ = "3.2.2"
+
+import warnings as _warnings
+_warnings.warn(
+    "agentmesh-platform is deprecated. Use agent-governance-toolkit-core instead. "
+    "See https://github.com/microsoft/agent-governance-toolkit/blob/main/docs/package-consolidation/MIGRATION.md",
+    DeprecationWarning,
+    stacklevel=2,
+)
+del _warnings
+__version__ = "3.6.0"
 
 # Layer 1: Identity & Zero-Trust Core
 from .identity import (
@@ -148,6 +158,10 @@ __all__ = [
     "AgentProfile",
     "TrustRecord",
     "TrustTracker",
+
+    # Telemetry
+    "bootstrap_otel",
+    "is_bootstrapped",
 ]
 
 # Trust types (shared across integrations)
@@ -156,3 +170,6 @@ from agentmesh.trust_types import (
     TrustRecord,
     TrustTracker,
 )
+
+# Telemetry bootstrap
+from agentmesh.telemetry import bootstrap_otel, is_bootstrapped

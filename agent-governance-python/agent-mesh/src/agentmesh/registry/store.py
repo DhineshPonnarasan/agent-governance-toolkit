@@ -29,7 +29,8 @@ class AgentRecord:
     last_seen: datetime = field(default_factory=_utcnow)
 
     # Pre-key bundle
-    identity_key: bytes | None = None
+    identity_key: bytes | None = None  # X25519 long-term key (32 bytes)
+    identity_key_ed: bytes | None = None  # Ed25519 signing key (32 bytes) — required to verify signed_pre_key signature
     signed_pre_key: bytes | None = None
     signed_pre_key_signature: bytes | None = None
     signed_pre_key_id: int | None = None
@@ -37,6 +38,33 @@ class AgentRecord:
 
     # Reputation
     reputation_score: float = 0.5
+
+    # Session counters (Phase 6.c follow-up). The EMA above is a
+    # rolling average — operators also want to see how many sessions
+    # contributed to it. Counters are bumped exclusively by
+    # `submit_session_reputation` (POST /v1/registry/reputation/session).
+    # Resetting requires `delete_agent` followed by re-registration —
+    # this is intentional so a buggy peer can't roll back its own
+    # history.
+    total_sessions: int = 0
+    successful_sessions: int = 0
+    failed_sessions: int = 0
+    timeout_sessions: int = 0
+    # ISO-8601 timestamp of the most recent session that scored this
+    # agent (initiator OR receiver). `None` until the first session.
+    last_session_at: datetime | None = None
+
+    # Entra Agent ID verification (Phase 6.c). Set by
+    # `POST /v1/registry/verify` after the verifier confirms an Entra
+    # JWT against tenant JWKS. `verified_app_id` is the Entra `appid`
+    # claim from the verified token; `tier` is bumped to "verified"
+    # so trust-scoring downstream can prefer cryptographically
+    # identified peers over anonymous ones. Both stay `None` for
+    # anonymous-tier agents and for clusters that haven't opted in.
+    verified_app_id: str | None = None
+    verified_tenant_id: str | None = None
+    verified_at: datetime | None = None
+    tier: str = "anonymous"
 
 
 class RegistryStore(Protocol):
@@ -48,6 +76,35 @@ class RegistryStore(Protocol):
     def search_by_capability(self, capability: str, limit: int) -> list[AgentRecord]: ...
     def consume_one_time_key(self, did: str) -> dict[str, Any] | None: ...
     def update_last_seen(self, did: str) -> None: ...
+    def try_update_last_seen(self, did: str, min_interval_seconds: float = 10.0) -> bool:
+        """Atomically update last_seen only if at least min_interval_seconds
+        have elapsed since the last update. Returns True if updated, False
+        if throttled. Implementations MUST be atomic."""
+        ...
+
+    def apply_reputation_update(
+        self,
+        did: str,
+        target_score: float,
+        alpha: float,
+        outcome_bucket: str | None,
+    ) -> float | None:
+        """Atomically apply an EMA reputation update and bump session counters.
+
+        Implementations MUST hold their internal lock across the
+        read-modify-write so concurrent updates against the same DID
+        cannot lose increments (the previous get_agent → mutate →
+        put_agent pattern had a classic lost-update race window).
+
+        ``outcome_bucket`` must be one of ``None``, ``"success"``,
+        ``"failed"``, or ``"timeout"``. ``None`` skips per-outcome
+        counter bumping (total_sessions still increments). Any other
+        value MUST raise ``ValueError``.
+
+        Returns the new ``reputation_score`` rounded to 4 places, or
+        ``None`` when the DID is not registered.
+        """
+        ...
 
 
 class InMemoryRegistryStore:
@@ -55,6 +112,7 @@ class InMemoryRegistryStore:
 
     def __init__(self) -> None:
         self._agents: dict[str, AgentRecord] = {}
+        self._last_heartbeat: dict[str, datetime] = {}
         self._lock = threading.Lock()
 
     def get_agent(self, did: str) -> AgentRecord | None:
@@ -67,6 +125,7 @@ class InMemoryRegistryStore:
 
     def delete_agent(self, did: str) -> bool:
         with self._lock:
+            self._last_heartbeat.pop(did, None)
             return self._agents.pop(did, None) is not None
 
     def search_by_capability(self, capability: str, limit: int = 50) -> list[AgentRecord]:
@@ -91,3 +150,58 @@ class InMemoryRegistryStore:
             agent = self._agents.get(did)
             if agent:
                 agent.last_seen = _utcnow()
+
+    def try_update_last_seen(self, did: str, min_interval_seconds: float = 10.0) -> bool:
+        """Atomically update last_seen only if enough time has elapsed
+        since the last heartbeat call (not since last_seen, which is set
+        at registration)."""
+        with self._lock:
+            agent = self._agents.get(did)
+            if not agent:
+                return False
+            now = _utcnow()
+            last_hb = self._last_heartbeat.get(did)
+            if last_hb is not None:
+                elapsed = (now - last_hb).total_seconds()
+                if elapsed < min_interval_seconds:
+                    return False
+            agent.last_seen = now
+            self._last_heartbeat[did] = now
+            return True
+
+    def apply_reputation_update(
+        self,
+        did: str,
+        target_score: float,
+        alpha: float,
+        outcome_bucket: str | None,
+    ) -> float | None:
+        """Atomic EMA + counter bump for a single agent.
+
+        Holds ``self._lock`` across the entire read-modify-write so
+        concurrent submissions against the same DID can't lose
+        increments. Replaces the legacy endpoint pattern
+        (``get_agent`` → mutate-in-place → ``put_agent``) which had a
+        lost-update window between the two locked calls.
+        """
+        if outcome_bucket not in (None, "success", "failed", "timeout"):
+            raise ValueError(
+                f"invalid outcome_bucket {outcome_bucket!r}; "
+                "expected None, 'success', 'failed', or 'timeout'"
+            )
+        with self._lock:
+            agent = self._agents.get(did)
+            if agent is None:
+                return None
+            agent.reputation_score = (
+                alpha * target_score + (1 - alpha) * agent.reputation_score
+            )
+            agent.total_sessions += 1
+            if outcome_bucket == "success":
+                agent.successful_sessions += 1
+            elif outcome_bucket == "failed":
+                agent.failed_sessions += 1
+            elif outcome_bucket == "timeout":
+                agent.timeout_sessions += 1
+            agent.last_session_at = _utcnow()
+            return round(agent.reputation_score, 4)

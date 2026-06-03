@@ -32,6 +32,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
+      pull-requests: read
       issues: write
       models: read
     if: >-
@@ -261,6 +262,13 @@ jobs:
             const overallVerdict = rows.some(r => r.includes('⚠️'))
               ? '**Verdict: ⚠️ AI review incomplete; ready for human review**'
               : '**Verdict: ✅ Ready for human review**';
+            const allVerdicts = rows.join('\n');
+            let overallVerdict;
+            if (allVerdicts.includes('⚠️')) {
+              overallVerdict = '**Verdict: ⚠️ AI review incomplete; ready for human review**';
+            } else {
+              overallVerdict = '**Verdict: ✅ Ready for human review**';
+            }
 
             const summaryBody = [
               SUMMARY_MARKER,
@@ -290,6 +298,11 @@ jobs:
               }
             } catch (error) {
               core.warning(`Unable to post PR summary comment: ${error.message}`);
+              if (error?.status === 403 && String(error?.message || '').includes('Resource not accessible')) {
+                core.warning('Unable to post advisory AI review summary because this run token cannot write PR comments.');
+              } else {
+                throw error;
+              }
             }
 
             await core.summary

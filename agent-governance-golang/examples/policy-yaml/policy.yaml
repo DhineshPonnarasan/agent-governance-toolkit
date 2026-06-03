@@ -1,0 +1,31 @@
+rules:
+  - name: allow-data-read
+    condition:
+      field: action
+      operator: eq
+      value: data.read
+    action: allow
+
+  - name: review-internal-write
+    condition:
+      field: classification
+      operator: eq
+      value: internal
+    action: audit
+
+  - name: deny-confidential-write
+    condition:
+      field: classification
+      operator: eq
+      value: confidential
+    action: deny
+
+  - name: allow-api-calls
+    condition:
+      field: action
+      operator: matches
+      value: "api.*"
+    action: allow
+
+defaults:
+  action: deny

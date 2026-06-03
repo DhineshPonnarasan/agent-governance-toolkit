@@ -17,7 +17,7 @@ import asyncio
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, List
 import subprocess
 
@@ -300,12 +300,22 @@ rules: []
         arguments = params.get("arguments", {})
 
         # Build policy context
-        context = {
+        context: Dict[str, Any] = {
             "action": {
                 "tool": tool_name,
                 "path": arguments.get("path", ""),
             }
         }
+
+        # Wire protocol context so sql.* and k8s.* policy rules can match
+        sql_query = arguments.get("query") or arguments.get("sql")
+        if sql_query and isinstance(sql_query, str):
+            context["sql"] = {"query": sql_query}
+
+        k8s_method = arguments.get("method") or arguments.get("http_method")
+        k8s_path = arguments.get("path") or arguments.get("api_path")
+        if k8s_method and k8s_path and isinstance(k8s_path, str) and k8s_path.startswith(("/api/", "/apis/")):
+            context["k8s"] = {"method": str(k8s_method).upper(), "path": k8s_path}
 
         # Check policy
         decision = self.policy_engine.evaluate(self.identity.did, context)
@@ -388,7 +398,7 @@ rules: []
     ):
         """Log tool call to audit trail."""
         entry = {
-            "timestamp": datetime.utcnow().isoformat() + "Z",
+            "timestamp": datetime.now(timezone.utc).isoformat() + "Z",
             "agent": str(self.identity.did),
             "action": "mcp_tool_call",
             "tool": tool_name,

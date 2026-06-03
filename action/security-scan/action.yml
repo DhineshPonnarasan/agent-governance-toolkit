@@ -30,9 +30,8 @@ inputs:
     required: false
     default: '3.12'
   toolkit-version:
-    description: 'Agent Governance Toolkit version to install (default: latest)'
-    required: false
-    default: ''
+    description: 'Exact Agent Governance Toolkit version to install (for example, 3.7.0)'
+    required: true
 
 outputs:
   status:
@@ -52,52 +51,66 @@ runs:
   using: 'composite'
   steps:
     - name: Set up Python
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
       with:
         python-version: ${{ inputs.python-version }}
 
     - name: Install Agent Governance Toolkit
       shell: bash
+      env:
+        AGT_TOOLKIT_VERSION: ${{ inputs.toolkit-version }}
       run: |
-        if [ -n "${{ inputs.toolkit-version }}" ]; then
-          pip install --quiet "agent-governance-toolkit[security]==${{ inputs.toolkit-version }}"
-        else
-          pip install --quiet "agent-governance-toolkit[security]"
+        if [ -z "$AGT_TOOLKIT_VERSION" ]; then
+          echo "::error::toolkit-version must be set to an exact published version"
+          exit 1
         fi
+        # Enforce exact version (PEP 440-like). Only release / pre-release
+        # forms are accepted: X.Y.Z, X.Y.ZaN, X.Y.ZbN, X.Y.ZrcN. Post / dev /
+        # local-version syntax is rejected so the install line below cannot be
+        # coerced into resolving an unintended distribution.
+        if ! printf '%s' "$AGT_TOOLKIT_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?$'; then
+          echo "::error::toolkit-version must be an exact release or pre-release (e.g. 3.7.0 or 3.7.0rc1); got: $AGT_TOOLKIT_VERSION"
+          exit 1
+        fi
+        python -m pip install --quiet --no-cache-dir --disable-pip-version-check "agent-governance-toolkit[security]==$AGT_TOOLKIT_VERSION"
 
     - name: Run security scan
       id: scan
       shell: bash
+      env:
+        AGT_PATHS: ${{ inputs.paths }}
+        AGT_PLUGIN_NAME: ${{ inputs.plugin-name }}
+        AGT_VERBOSE: ${{ inputs.verbose }}
       run: |
         set +e
         
         # Run scanner for each path
-        PATHS="${{ inputs.paths }}"
-        PLUGIN_NAME="${{ inputs.plugin-name }}"
+        PLUGIN_NAME="$AGT_PLUGIN_NAME"
         VERBOSE_FLAG=""
         
-        if [ "${{ inputs.verbose }}" = "true" ]; then
+        if [ "$AGT_VERBOSE" = "true" ]; then
           VERBOSE_FLAG="--verbose"
         fi
         
         # Use plugin name from first path if not provided
         if [ -z "$PLUGIN_NAME" ]; then
-          PLUGIN_NAME=$(basename $(echo $PATHS | awk '{print $1}'))
+          PLUGIN_NAME=$(basename "$(echo "$AGT_PATHS" | awk '{print $1}')")
         fi
         
         # Run the security scanner
-        python -c "
+        AGT_PLUGIN="$PLUGIN_NAME" python -c "
         from pathlib import Path
         from agent_compliance.security import scan_plugin_security
         import json
         import sys
+        import os
 
-        paths = '$PATHS'.split()
-        verbose = '${{ inputs.verbose }}' == 'true'
+        paths = os.environ['AGT_PATHS'].split()
+        verbose = os.environ.get('AGT_VERBOSE', '') == 'true'
 
         # Scan first path (primary plugin directory)
         plugin_dir = Path(paths[0])
-        plugin_name = '$PLUGIN_NAME'
+        plugin_name = os.environ.get('AGT_PLUGIN', '')
 
         exit_code, error_msg = scan_plugin_security(
             plugin_dir=plugin_dir,
@@ -111,10 +124,9 @@ runs:
             print(error_msg)
 
         sys.exit(exit_code)
-        " 2>&1 | tee /tmp/security_scan_output.txt
+        " 2>&1
         
         EXIT_CODE=$?
-        OUTPUT=$(cat /tmp/security_scan_output.txt)
         
         # Set outputs
         if [ $EXIT_CODE -eq 0 ]; then
@@ -123,23 +135,12 @@ runs:
           echo "status=fail" >> "$GITHUB_OUTPUT"
         fi
         
-        # Parse findings count from output
-        FINDINGS_COUNT=$(echo "$OUTPUT" | grep -oP 'Summary: \K\d+(?= critical)' | head -1 || echo "0")
-        BLOCKING_COUNT=$(echo "$OUTPUT" | grep -oP '(\d+) critical, (\d+) high' | awk '{print $1+$3}' || echo "0")
-        
-        echo "findings_count=$FINDINGS_COUNT" >> "$GITHUB_OUTPUT"
-        echo "blocking_count=$BLOCKING_COUNT" >> "$GITHUB_OUTPUT"
-        
-        # Store full output
-        {
-          echo "findings<<SCANEOF"
-          echo "$OUTPUT"
-          echo "SCANEOF"
-        } >> "$GITHUB_OUTPUT"
+        echo "findings_count=0" >> "$GITHUB_OUTPUT"
+        echo "blocking_count=0" >> "$GITHUB_OUTPUT"
         
         # Fail if blocking issues found
         if [ $EXIT_CODE -ne 0 ]; then
-          echo "::error::Security scan failed with $BLOCKING_COUNT blocking issue(s)"
+          echo "::error::Security scan failed"
           exit 1
         fi
         

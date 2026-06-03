@@ -1,0 +1,33 @@
+{
+  "metadata": {
+    "dbt_schema_version": "https://schemas.getdbt.com/dbt/run-results/v5/manifest.json",
+    "dbt_version": "1.11.7",
+    "generated_at": "2026-05-14T08:00:00",
+    "invocation_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+    "env": {}
+  },
+  "results": [
+    {
+      "unique_id": "test.analytics.not_null_user_events_user_id.a1b2c3",
+      "status": "pass",
+      "failures": 0,
+      "message": null,
+      "execution_time": 0.42
+    },
+    {
+      "unique_id": "test.analytics.accepted_values_user_events_event_type.d4e5f6",
+      "status": "pass",
+      "failures": 0,
+      "message": null,
+      "execution_time": 0.38
+    },
+    {
+      "unique_id": "test.analytics.not_null_user_events_session_id.g7h8i9",
+      "status": "pass",
+      "failures": 0,
+      "message": null,
+      "execution_time": 0.31
+    }
+  ],
+  "elapsed_time": 4.21
+}

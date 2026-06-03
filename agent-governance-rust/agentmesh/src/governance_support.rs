@@ -16,16 +16,99 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static ATOMIC_WRITE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn unix_secs_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// Replaces a file through a synced temp-file write and rename so readers do not observe partial JSON.
+fn write_file_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    write_file_atomic_with_parent_sync(path, contents, sync_parent_directory)
+}
+
+/// Runs the atomic file replacement with an injectable parent-directory sync hook.
+fn write_file_atomic_with_parent_sync<F>(
+    path: &Path,
+    contents: &[u8],
+    sync_parent: F,
+) -> std::io::Result<()>
+where
+    F: FnOnce(&Path) -> std::io::Result<()>,
+{
+    let temp_path = atomic_temp_path(path)?;
+    let parent = atomic_parent_path(path);
+    let write_result = (|| {
+        let mut temp = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        temp.write_all(contents)?;
+        temp.sync_all()
+    })();
+
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    sync_parent(parent)
+}
+
+/// Returns the directory entry that must be synced after an atomic rename.
+fn atomic_parent_path(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Syncs the parent directory so the renamed entry is durable on Unix filesystems.
+#[cfg(unix)]
+fn sync_parent_directory(parent: &Path) -> std::io::Result<()> {
+    fs::File::open(parent)?.sync_all()
+}
+
+/// No-ops parent-directory sync where Rust does not expose portable directory fsync.
+#[cfg(not(unix))]
+fn sync_parent_directory(_parent: &Path) -> std::io::Result<()> {
+    // The Rust standard library does not expose a portable way to open and
+    // fsync a directory on non-Unix targets. Keep those platforms conservative
+    // and portable while Unix gets the stronger directory-entry durability.
+    Ok(())
+}
+
+fn atomic_temp_path(path: &Path) -> std::io::Result<PathBuf> {
+    let file_name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "atomic write target must include a file name",
+        )
+    })?;
+    let parent = atomic_parent_path(path);
+    let counter = ATOMIC_WRITE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let process_id = std::process::id();
+    let temp_name = format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        process_id,
+        counter
+    );
+    Ok(parent.join(temp_name))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,6 +118,40 @@ pub enum ComplianceFramework {
     Soc2,
     Hipaa,
     Gdpr,
+}
+
+impl ComplianceFramework {
+    /// Approximate count of high-level controls for this framework, used
+    /// as the denominator when computing a compliance score.
+    ///
+    /// Each value reflects the framework's published top-level groupings:
+    ///
+    /// * **EU AI Act** — 8 obligations for high-risk AI systems
+    ///   (Articles 8–15: risk management, data governance, technical
+    ///   documentation, record-keeping, transparency, human oversight,
+    ///   accuracy/robustness/cybersecurity, quality management).
+    /// * **SOC 2** — 5 Trust Services Criteria categories (Security,
+    ///   Availability, Confidentiality, Processing Integrity, Privacy).
+    /// * **HIPAA** — 3 Security Rule safeguard categories
+    ///   (Administrative, Physical, Technical) plus the Privacy Rule and
+    ///   Breach Notification Rule = 5.
+    /// * **GDPR** — 7 data-protection principles enumerated in
+    ///   Article 5(1) (lawfulness, purpose limitation, data minimisation,
+    ///   accuracy, storage limitation, integrity & confidentiality,
+    ///   accountability).
+    ///
+    /// These are coarse approximations chosen because the framework
+    /// publishes them at this level; deployments with a richer control
+    /// catalogue should compute their own score rather than rely on this
+    /// engine's report.
+    pub fn default_control_count(self) -> u32 {
+        match self {
+            ComplianceFramework::EuAiAct => 8,
+            ComplianceFramework::Soc2 => 5,
+            ComplianceFramework::Hipaa => 5,
+            ComplianceFramework::Gdpr => 7,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,10 +237,12 @@ impl ComplianceEngine {
             .cloned()
             .collect::<Vec<_>>();
         let controls_failed = violations.len() as u32;
-        let total_controls: u32 = 10;
-        let compliance_score = ((total_controls.saturating_sub(controls_failed)) as f64
-            / total_controls as f64)
-            * 100.0;
+        let total_controls = framework.default_control_count();
+        // `.max(1)` is a defensive floor: if a future variant ever returns
+        // 0 the score becomes 0 rather than `0/0 == NaN`.
+        let denominator = total_controls.max(1);
+        let compliance_score =
+            ((denominator.saturating_sub(controls_failed)) as f64 / denominator as f64) * 100.0;
         ComplianceReport {
             report_id: format!("report_{:016x}", rand::random::<u64>()),
             generated_at_secs: unix_secs_now(),
@@ -181,7 +300,12 @@ impl AuditSink for FileAuditSink {
             Vec::new()
         };
         entries.push(entry.clone());
-        fs::write(&self.path, serde_json::to_string_pretty(&entries).unwrap())
+        // serde_json serialization fails on non-finite floats (NaN, ±Inf)
+        // inside `details` because JSON has no representation for them.
+        // Propagate the error instead of panicking on the audit-write path.
+        let serialized = serde_json::to_vec(&entries)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        write_file_atomic(&self.path, &serialized)
     }
 }
 
@@ -369,7 +493,9 @@ impl TrustCondition {
             (ConditionOperator::Matches, Some(Value::String(actual))) => self
                 .value
                 .as_str()
-                .and_then(|pattern| Regex::new(pattern).ok().map(|regex| regex.is_match(actual)))
+                .and_then(|pattern| {
+                    crate::regex_cache::compiled_regex(pattern).map(|regex| regex.is_match(actual))
+                })
                 .unwrap_or(false),
             _ => false,
         }
@@ -474,6 +600,11 @@ pub struct PolicyBackendDiagnostic {
 }
 
 impl PolicyBackendDiagnostic {
+    /// Reserved for the in-progress policy compiler subsystem below
+    /// (`parse_opa_rules` / `parse_cedar_rules` and friends). Kept here so
+    /// the diagnostic API stays symmetric with `::error` once the compiler
+    /// callers come online.
+    #[allow(dead_code)]
     fn warning(message: impl Into<String>, expression: impl Into<String>) -> Self {
         Self {
             severity: PolicyDiagnosticSeverity::Warning,
@@ -785,11 +916,34 @@ fn evaluate_rego_rule(engine: &mut RegoEngine, package_path: &str, rule_name: &s
 }
 
 fn cedar_request(input: &HashMap<String, Value>) -> Result<CedarRequest, String> {
-    let principal = cedar_entity_uid_from_input(input, "principal", "Principal")?;
-    let action = cedar_entity_uid_from_input(input, "action", "Action")?;
-    let resource = cedar_entity_uid_from_input(input, "resource", "Resource")?;
+    // cedar-policy 4.x removed "unspecified" entities from `Request::new`: principal,
+    // action, and resource are now concrete `EntityUid`s, the constructor takes an
+    // optional schema, and it returns a validation `Result`. To preserve the prior
+    // behavior — where an absent entity acted as an unspecified one that still satisfied
+    // an unconstrained scope (e.g. `permit(principal, action, resource)`) but never a
+    // `principal == ...` constraint — we substitute a reserved placeholder UID for any
+    // absent component. No schema is supplied (`None`), preserving prior validation scope.
+    let principal = cedar_entity_uid_or_placeholder(input, "principal", "Principal")?;
+    let action = cedar_entity_uid_or_placeholder(input, "action", "Action")?;
+    let resource = cedar_entity_uid_or_placeholder(input, "resource", "Resource")?;
     let context = cedar_context(input)?;
-    Ok(CedarRequest::new(principal, action, resource, context))
+    CedarRequest::new(principal, action, resource, context, None).map_err(|error| error.to_string())
+}
+
+/// Resolve an entity UID from the input, falling back to a reserved placeholder
+/// (`<Type>::"__unspecified__"`) when the key is absent. The placeholder matches an
+/// unconstrained scope but no equality/`in` constraint, mirroring cedar 2.x's
+/// unspecified-entity semantics that 4.x's `Request::new` no longer expresses directly.
+fn cedar_entity_uid_or_placeholder(
+    input: &HashMap<String, Value>,
+    key: &str,
+    default_type: &str,
+) -> Result<CedarEntityUid, String> {
+    match cedar_entity_uid_from_input(input, key, default_type)? {
+        Some(uid) => Ok(uid),
+        None => CedarEntityUid::from_str(&format!(r#"{default_type}::"__unspecified__""#))
+            .map_err(|error| error.to_string()),
+    }
 }
 
 fn cedar_context(input: &HashMap<String, Value>) -> Result<CedarContext, String> {
@@ -837,6 +991,21 @@ fn cedar_escape_identifier(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+// ---------------------------------------------------------------------------
+// In-progress policy-expression compiler.
+//
+// The items below (PolicyOperator / PolicyCondition / PolicyRuleClause /
+// CompiledPolicyRule plus the `parse_*`, `compile_*`, `collect_*`, `split_*`,
+// `normalize_*`, `resolve_*`, `looks_like_*`, and `strip_*` free functions)
+// form a self-contained subsystem for parsing OPA/Cedar rule bodies into a
+// compiled in-memory AST. Production code does not yet route through it —
+// the live `PolicyEvaluator` calls regorus / cedar-policy directly — so the
+// whole tree is dead-code-warned. Items are individually marked
+// `#[allow(dead_code)]` (not the parent module) so that any other genuinely
+// dead code added to this file continues to surface in `cargo check`.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PolicyOperator {
     Eq,
@@ -853,6 +1022,7 @@ enum PolicyOperator {
     RegexMatch,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct PolicyCondition {
     path: String,
@@ -860,11 +1030,13 @@ struct PolicyCondition {
     expected: Value,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 struct PolicyRuleClause {
     conditions: Vec<PolicyCondition>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct CompiledPolicyRule {
     name: String,
@@ -872,6 +1044,7 @@ struct CompiledPolicyRule {
     clauses: Vec<PolicyRuleClause>,
 }
 
+#[allow(dead_code)]
 impl CompiledPolicyRule {
     fn matches<'a>(&'a self, input: &HashMap<String, Value>) -> Option<(&'a Self, usize)> {
         self.clauses
@@ -882,6 +1055,7 @@ impl CompiledPolicyRule {
     }
 }
 
+#[allow(dead_code)]
 impl PolicyRuleClause {
     fn matches(&self, input: &HashMap<String, Value>) -> bool {
         self.conditions
@@ -890,6 +1064,7 @@ impl PolicyRuleClause {
     }
 }
 
+#[allow(dead_code)]
 impl PolicyCondition {
     fn matches(&self, input: &HashMap<String, Value>) -> bool {
         let Some(actual) = resolve_policy_value(input, &self.path) else {
@@ -952,15 +1127,14 @@ impl PolicyCondition {
                 .as_str()
                 .zip(self.expected.as_str())
                 .and_then(|(actual, expected)| {
-                    Regex::new(expected)
-                        .ok()
-                        .map(|regex| regex.is_match(actual))
+                    crate::regex_cache::compiled_regex(expected).map(|regex| regex.is_match(actual))
                 })
                 .unwrap_or(false),
         }
     }
 }
 
+#[allow(dead_code)]
 fn parse_opa_rules(
     source: &str,
     rule_name: &str,
@@ -980,6 +1154,7 @@ fn parse_opa_rules(
         .collect()
 }
 
+#[allow(dead_code)]
 fn parse_cedar_rules(
     source: &str,
     keyword: &str,
@@ -994,8 +1169,9 @@ fn parse_cedar_rules(
         .collect()
 }
 
+#[allow(dead_code)]
 fn collect_policy_bodies(source: &str, rule_name: &str, keyword: &str) -> Vec<String> {
-    let start = format!("{rule_name}");
+    let start = rule_name.to_string();
     let mut results = Vec::new();
     let mut current = String::new();
     let mut collecting = false;
@@ -1038,6 +1214,7 @@ fn collect_policy_bodies(source: &str, rule_name: &str, keyword: &str) -> Vec<St
     results
 }
 
+#[allow(dead_code)]
 fn compile_policy_rule(
     name: String,
     raw_expression: String,
@@ -1064,6 +1241,7 @@ fn compile_policy_rule(
     }
 }
 
+#[allow(dead_code)]
 fn parse_policy_clause(
     clause: &str,
     prefix_to_trim: &str,
@@ -1080,6 +1258,7 @@ fn parse_policy_clause(
     }
 }
 
+#[allow(dead_code)]
 fn split_top_level(input: &str, delimiters: &[&str]) -> Vec<String> {
     let mut parts = Vec::new();
     let mut start = 0usize;
@@ -1145,6 +1324,7 @@ fn split_top_level(input: &str, delimiters: &[&str]) -> Vec<String> {
     parts
 }
 
+#[allow(dead_code)]
 fn parse_policy_condition(
     input: &str,
     prefix_to_trim: &str,
@@ -1214,6 +1394,7 @@ fn parse_policy_condition(
     None
 }
 
+#[allow(dead_code)]
 fn parse_policy_function(
     input: &str,
     prefix_to_trim: &str,
@@ -1273,6 +1454,7 @@ fn parse_policy_function(
     }
 }
 
+#[allow(dead_code)]
 fn looks_like_boolean_path(input: &str) -> bool {
     !input.is_empty()
         && !input.contains(' ')
@@ -1286,6 +1468,7 @@ fn looks_like_boolean_path(input: &str) -> bool {
         && !input.contains('<')
 }
 
+#[allow(dead_code)]
 fn strip_wrapping_parentheses(input: &str) -> &str {
     let mut trimmed = input.trim();
     while trimmed.starts_with('(') && trimmed.ends_with(')') && trimmed.len() > 1 {
@@ -1294,12 +1477,14 @@ fn strip_wrapping_parentheses(input: &str) -> &str {
     trimmed
 }
 
+#[allow(dead_code)]
 fn normalize_policy_path(path: &str, prefix_to_trim: &str) -> String {
     strip_wrapping_parentheses(path.trim())
         .trim_start_matches(prefix_to_trim)
         .to_string()
 }
 
+#[allow(dead_code)]
 fn parse_policy_value(input: &str) -> Value {
     let trimmed = strip_wrapping_parentheses(input.trim());
     if (trimmed.starts_with('[') && trimmed.ends_with(']'))
@@ -1334,6 +1519,7 @@ fn parse_policy_value(input: &str) -> Value {
     }
 }
 
+#[allow(dead_code)]
 fn resolve_policy_value<'a>(input: &'a HashMap<String, Value>, path: &str) -> Option<&'a Value> {
     let mut parts = path.split('.');
     let first = parts.next()?;
@@ -1403,7 +1589,12 @@ pub struct FederationDecision {
 }
 
 pub trait FederationStore: Send + Sync {
-    fn save_policy(&self, policy: OrgPolicy);
+    /// Persist a policy for an organization.
+    ///
+    /// Implementations may fail for I/O reasons (file-backed stores) or
+    /// serialization reasons; callers must handle the error rather than
+    /// silently lose the write.
+    fn save_policy(&self, policy: OrgPolicy) -> std::io::Result<()>;
     fn get_policy(&self, organization_id: &str) -> Option<OrgPolicy>;
 }
 
@@ -1413,11 +1604,12 @@ pub struct InMemoryFederationStore {
 }
 
 impl FederationStore for InMemoryFederationStore {
-    fn save_policy(&self, policy: OrgPolicy) {
+    fn save_policy(&self, policy: OrgPolicy) -> std::io::Result<()> {
         self.policies
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(policy.organization_id.clone(), policy);
+        Ok(())
     }
 
     fn get_policy(&self, organization_id: &str) -> Option<OrgPolicy> {
@@ -1451,15 +1643,13 @@ impl FileFederationStore {
 }
 
 impl FederationStore for FileFederationStore {
-    fn save_policy(&self, policy: OrgPolicy) {
-        self.inner.save_policy(policy.clone());
+    fn save_policy(&self, policy: OrgPolicy) -> std::io::Result<()> {
+        self.inner.save_policy(policy.clone())?;
         let mut policies = self.read_policy_map();
         policies.insert(policy.organization_id.clone(), policy);
-        let _ = fs::write(
-            &self.path,
-            serde_json::to_string_pretty(&policies)
-                .expect("failed to serialize federation policy store"),
-        );
+        let serialized = serde_json::to_vec(&policies)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        write_file_atomic(&self.path, &serialized)
     }
 
     fn get_policy(&self, organization_id: &str) -> Option<OrgPolicy> {
@@ -1609,6 +1799,85 @@ mod tests {
     }
 
     #[test]
+    fn compliance_report_uses_framework_specific_control_count() {
+        let engine = ComplianceEngine::new(vec![
+            ComplianceFramework::Soc2,
+            ComplianceFramework::Gdpr,
+            ComplianceFramework::Hipaa,
+            ComplianceFramework::EuAiAct,
+        ]);
+        for framework in [
+            ComplianceFramework::Soc2,
+            ComplianceFramework::Gdpr,
+            ComplianceFramework::Hipaa,
+            ComplianceFramework::EuAiAct,
+        ] {
+            let report = engine.generate_report(framework);
+            assert_eq!(
+                report.total_controls,
+                framework.default_control_count(),
+                "report denominator must match the framework's published \
+                 top-level control count, not a hardcoded value"
+            );
+        }
+    }
+
+    #[test]
+    fn compliance_score_is_full_when_no_violations() {
+        let engine = ComplianceEngine::default();
+        let report = engine.generate_report(ComplianceFramework::Soc2);
+        assert_eq!(report.controls_failed, 0);
+        assert_eq!(report.compliance_score, 100.0);
+    }
+
+    #[test]
+    fn compliance_score_reflects_one_violation_relative_to_framework_size() {
+        let engine = ComplianceEngine::default();
+        engine.record_violation(
+            ComplianceFramework::Soc2,
+            "did:agentmesh:test",
+            "x",
+            "c",
+            "low",
+            "d",
+        );
+        let report = engine.generate_report(ComplianceFramework::Soc2);
+        // SOC 2 = 5 top-level criteria, 1 failed → 4/5 = 80%.
+        assert_eq!(report.compliance_score, 80.0);
+    }
+
+    #[test]
+    fn compliance_score_floors_at_zero_when_violations_exceed_controls() {
+        let engine = ComplianceEngine::default();
+        for i in 0..10 {
+            engine.record_violation(
+                ComplianceFramework::Soc2,
+                "did:agentmesh:test",
+                "x",
+                &format!("c{i}"),
+                "low",
+                "d",
+            );
+        }
+        let report = engine.generate_report(ComplianceFramework::Soc2);
+        assert_eq!(report.compliance_score, 0.0);
+    }
+
+    #[test]
+    fn each_framework_publishes_a_nonzero_control_count() {
+        // Guards the divide-by-zero floor in `generate_report`: every
+        // variant must contribute a positive denominator.
+        for framework in [
+            ComplianceFramework::EuAiAct,
+            ComplianceFramework::Soc2,
+            ComplianceFramework::Hipaa,
+            ComplianceFramework::Gdpr,
+        ] {
+            assert!(framework.default_control_count() > 0);
+        }
+    }
+
+    #[test]
     fn shadow_mode_records_results() {
         let shadow = ShadowMode::new();
         let result = shadow.record(false, true, Some("would have allowed".into()));
@@ -1672,15 +1941,17 @@ mod tests {
     #[test]
     fn federation_engine_applies_rules() {
         let store = Arc::new(InMemoryFederationStore::default());
-        store.save_policy(OrgPolicy {
-            organization_id: "contoso".into(),
-            rules: vec![OrgPolicyRule {
-                name: "deny-shell".into(),
-                category: PolicyCategory::Execution,
-                action_pattern: "shell".into(),
-                decision: "deny".into(),
-            }],
-        });
+        store
+            .save_policy(OrgPolicy {
+                organization_id: "contoso".into(),
+                rules: vec![OrgPolicyRule {
+                    name: "deny-shell".into(),
+                    category: PolicyCategory::Execution,
+                    action_pattern: "shell".into(),
+                    decision: "deny".into(),
+                }],
+            })
+            .unwrap();
         let engine = FederationEngine::new(store);
         assert!(!engine.evaluate("contoso", "shell:rm").allowed);
     }
@@ -1688,15 +1959,17 @@ mod tests {
     #[test]
     fn federation_engine_denies_without_policy_or_rule_match() {
         let store = Arc::new(InMemoryFederationStore::default());
-        store.save_policy(OrgPolicy {
-            organization_id: "contoso".into(),
-            rules: vec![OrgPolicyRule {
-                name: "allow-data".into(),
-                category: PolicyCategory::DataAccess,
-                action_pattern: "data.read".into(),
-                decision: "allow".into(),
-            }],
-        });
+        store
+            .save_policy(OrgPolicy {
+                organization_id: "contoso".into(),
+                rules: vec![OrgPolicyRule {
+                    name: "allow-data".into(),
+                    category: PolicyCategory::DataAccess,
+                    action_pattern: "data.read".into(),
+                    decision: "allow".into(),
+                }],
+            })
+            .unwrap();
         let engine = FederationEngine::new(store);
         assert!(!engine.evaluate("missing", "data.read").allowed);
         assert!(!engine.evaluate("contoso", "shell:rm").allowed);
@@ -1900,17 +2173,216 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().unwrap();
         let store = FileFederationStore::new(temp.path());
 
-        store.save_policy(OrgPolicy {
-            organization_id: "org-a".into(),
-            rules: vec![],
-        });
-        store.save_policy(OrgPolicy {
-            organization_id: "org-b".into(),
-            rules: vec![],
-        });
+        store
+            .save_policy(OrgPolicy {
+                organization_id: "org-a".into(),
+                rules: vec![],
+            })
+            .unwrap();
+        store
+            .save_policy(OrgPolicy {
+                organization_id: "org-b".into(),
+                rules: vec![],
+            })
+            .unwrap();
 
         assert!(store.get_policy("org-a").is_some());
         assert!(store.get_policy("org-b").is_some());
+    }
+
+    #[test]
+    fn file_audit_sink_writes_compact_json() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let sink = FileAuditSink::new(temp.path());
+
+        sink.record(&AuditEntry {
+            seq: 0,
+            timestamp: "2026-01-01T00:00:00Z".into(),
+            agent_id: "agent-1".into(),
+            action: "data.read".into(),
+            decision: "allow".into(),
+            previous_hash: String::new(),
+            hash: "abc123".into(),
+        })
+        .unwrap();
+
+        let raw = fs::read_to_string(temp.path()).unwrap();
+        let entries = serde_json::from_str::<Vec<AuditEntry>>(&raw).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(!raw.contains('\n'));
+        assert!(!raw.contains("  \""));
+    }
+
+    #[test]
+    fn file_federation_store_writes_compact_json() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let store = FileFederationStore::new(temp.path());
+
+        store
+            .save_policy(OrgPolicy {
+                organization_id: "org-a".into(),
+                rules: vec![OrgPolicyRule {
+                    name: "allow-read".into(),
+                    category: PolicyCategory::DataAccess,
+                    action_pattern: "data.read".into(),
+                    decision: "allow".into(),
+                }],
+            })
+            .unwrap();
+
+        let raw = fs::read_to_string(temp.path()).unwrap();
+        let policies = serde_json::from_str::<HashMap<String, OrgPolicy>>(&raw).unwrap();
+        assert!(policies.contains_key("org-a"));
+        assert!(!raw.contains('\n'));
+        assert!(!raw.contains("  \""));
+    }
+
+    #[test]
+    fn atomic_temp_path_generates_distinct_names() {
+        let target = Path::new("audit.json");
+
+        let first = atomic_temp_path(target).unwrap();
+        let second = atomic_temp_path(target).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(Path::new(".")));
+    }
+
+    #[test]
+    fn atomic_parent_path_handles_plain_file_names() {
+        assert_eq!(atomic_parent_path(Path::new("audit.json")), Path::new("."));
+        assert_eq!(
+            atomic_parent_path(Path::new("logs/audit.json")),
+            Path::new("logs")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_parent_path_handles_unix_root_directory() {
+        assert_eq!(atomic_parent_path(Path::new("/")), Path::new("."));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_parent_directory_surfaces_missing_unix_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let missing_parent = root.path().join("missing");
+
+        let result = sync_parent_directory(&missing_parent);
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn sync_parent_directory_noops_on_non_unix_targets() {
+        let missing_parent = Path::new("agentmesh-missing-parent-for-non-unix-test");
+
+        let result = sync_parent_directory(missing_parent);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn write_file_atomic_returns_err_when_parent_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("missing").join("audit.json");
+
+        let result = write_file_atomic(&target, b"[]");
+
+        assert!(result.is_err());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn write_file_atomic_cleans_temp_file_when_rename_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("audit.json");
+        fs::create_dir(&target).unwrap();
+
+        let result = write_file_atomic(&target, br#"{"ok":true}"#);
+
+        assert!(result.is_err());
+        assert!(target.is_dir());
+
+        let leaked_temp_files = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".audit.json.") && name.ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(
+            leaked_temp_files.is_empty(),
+            "atomic write leaked temp files after rename failure: {leaked_temp_files:?}"
+        );
+    }
+
+    #[test]
+    fn write_file_atomic_calls_parent_directory_sync_after_rename() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("audit.json");
+        let synced_parents = std::cell::RefCell::new(Vec::new());
+        let target_for_sync = target.clone();
+
+        write_file_atomic_with_parent_sync(&target, br#"{"ok":true}"#, |parent| {
+            assert_eq!(fs::read(&target_for_sync).unwrap(), br#"{"ok":true}"#);
+            synced_parents.borrow_mut().push(parent.to_path_buf());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(synced_parents.into_inner(), vec![root.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn write_file_atomic_surfaces_parent_directory_sync_error() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("audit.json");
+
+        let result = write_file_atomic_with_parent_sync(&target, b"durable", |_parent| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "directory sync failed",
+            ))
+        });
+
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "directory sync failed");
+        assert_eq!(fs::read(&target).unwrap(), b"durable");
+
+        let leaked_temp_files = fs::read_dir(root.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".audit.json.") && name.ends_with(".tmp"))
+            .collect::<Vec<_>>();
+        assert!(
+            leaked_temp_files.is_empty(),
+            "atomic write leaked temp files after parent sync failure: {leaked_temp_files:?}"
+        );
+    }
+
+    /// Regression: prior to fallibilizing the trait, FileFederationStore
+    /// used `let _ = fs::write(...)` and silently swallowed I/O errors.
+    /// A path pointing into a non-existent directory now surfaces as an
+    /// Err instead of being lost.
+    #[test]
+    fn file_federation_store_returns_err_on_unwriteable_path() {
+        let unwriteable = std::env::temp_dir()
+            .join("agentmesh-federation-store-tests-nonexistent-parent")
+            .join("policies.json");
+        let _ = fs::remove_dir_all(unwriteable.parent().unwrap());
+
+        let store = FileFederationStore::new(&unwriteable);
+        let result = store.save_policy(OrgPolicy {
+            organization_id: "ghost".into(),
+            rules: vec![],
+        });
+        assert!(
+            result.is_err(),
+            "expected save_policy to surface the I/O error, got Ok"
+        );
     }
 
     #[test]

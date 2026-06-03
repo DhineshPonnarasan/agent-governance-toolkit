@@ -9,6 +9,7 @@ First-class agent identity with:
 - Ephemeral credentials (15-min TTL)
 - SPIFFE/SVID workload identity
 - Microsoft Entra Agent ID integration
+- External JWKS federation for cross-org identity (per ADR-0007)
 """
 
 from .agent_id import AgentDID, AgentIdentity
@@ -16,6 +17,7 @@ from .attestation import (
     AttestationClaims,
     AttestationEvidence,
     ConfidentialLevel,
+    ImageMatchPolicy,
     KeyOrigin,
     ReferenceValues,
     compute_report_data_hash,
@@ -23,10 +25,23 @@ from .attestation import (
     matches_report_data_binding,
     public_key_hash_hex,
 )
+from .attestation_collector import (
+    AttestationCollector,
+    MockAttestationCollector,
+    NoopAttestationCollector,
+)
+from .attestation_verifier import AttestationVerifier, MockAttestationVerifier
 from .credentials import Credential, CredentialManager
 from .delegation import DelegationLink, ScopeChain, UserContext
 from .entra import EntraAgentBlueprint, EntraAgentIdentity, EntraAgentRegistry
 from .entra_agent_id import EntraAgentID
+from .external_jwks import (
+    DelegationClaims,
+    ExternalIdentity,
+    ExternalJWKSProvider,
+    FederationPolicy,
+    TrustedEndpoint,
+)
 from .jwk import from_jwk, from_jwks, to_jwk, to_jwks
 from .keystore import KeyStore, PKCS11KeyStore, SoftwareKeyStore
 from .managed_identity import (
@@ -43,6 +58,14 @@ from .risk import RiskScore, RiskScorer
 from .rotation import KeyRotationManager
 from .spiffe import SVID, SPIFFEIdentity
 from .sponsor import HumanSponsor
+from .tee_keystore import (
+    LocalTEEKeyStore,
+    MockSKRKeyStore,
+    SoftwareKeyHandle,
+    TEEKeyHandle,
+    TEEKeyStore,
+    require_tee_bound_key,
+)
 
 __all__ = [
     "AgentIdentity",
@@ -72,11 +95,23 @@ __all__ = [
     "KeyStore",
     "SoftwareKeyStore",
     "PKCS11KeyStore",
+    "TEEKeyStore",
+    "TEEKeyHandle",
+    "SoftwareKeyHandle",
+    "LocalTEEKeyStore",
+    "MockSKRKeyStore",
+    "require_tee_bound_key",
     "AttestationClaims",
     "AttestationEvidence",
     "ConfidentialLevel",
+    "ImageMatchPolicy",
     "KeyOrigin",
     "ReferenceValues",
+    "AttestationCollector",
+    "MockAttestationCollector",
+    "NoopAttestationCollector",
+    "AttestationVerifier",
+    "MockAttestationVerifier",
     "compute_report_data_hash",
     "compute_report_data_hash_hex",
     "matches_report_data_binding",
@@ -89,4 +124,10 @@ __all__ = [
     "EntraManagedIdentity",
     "AWSIAMIdentity",
     "GCPWorkloadIdentity",
+    # External JWKS federation (ADR-0007)
+    "DelegationClaims",
+    "ExternalIdentity",
+    "ExternalJWKSProvider",
+    "FederationPolicy",
+    "TrustedEndpoint",
 ]

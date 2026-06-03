@@ -18,7 +18,6 @@ from typing import Optional
 from agent_marketplace.manifest import MarketplaceError, PluginManifest, PluginType
 from agent_marketplace.marketplace_policy import (
     MarketplacePolicy,
-    OrgMarketplacePolicy,
     evaluate_plugin_compliance,
 )
 
@@ -209,9 +208,8 @@ class PluginRegistry:
         """
         results: list[PluginManifest] = []
         with self._lock:
-            for name in self._plugins:
-                for version in self._plugins[name]:
-                    manifest = self._plugins[name][version]
+            for versions in self._plugins.values():
+                for manifest in versions.values():
                     if manifest.organization is None or manifest.organization == organization:
                         results.append(manifest)
         return results

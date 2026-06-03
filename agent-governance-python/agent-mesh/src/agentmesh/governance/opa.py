@@ -40,7 +40,10 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
+
+if TYPE_CHECKING:
+    from agentmesh.governance.backend import PolicyDecisionResult
 
 logger = logging.getLogger(__name__)
 
@@ -188,17 +191,25 @@ class OPAEvaluator:
             )
 
     def _evaluate_local(self, query: str, input_data: dict) -> OPADecision:
-        """Evaluate using local `opa eval` CLI or built-in fallback."""
+        """Evaluate using local `opa eval` CLI.
+
+        When the OPA CLI is not available, returns a deny decision with
+        an explicit error instead of silently falling back to a mock
+        evaluator that cannot handle non-trivial Rego.
+        """
         if self._opa_available and (self.rego_path or self.rego_content):
             return self._evaluate_opa_cli(query, input_data)
 
-        # Fallback: parse simple Rego rules ourselves
-        if self.rego_content:
-            return self._evaluate_builtin(query, input_data)
-
-        if self.rego_path and Path(self.rego_path).exists():
-            self.rego_content = Path(self.rego_path).read_text()
-            return self._evaluate_builtin(query, input_data)
+        if self.rego_content or (self.rego_path and Path(self.rego_path).exists()):
+            return OPADecision(
+                allowed=False,
+                query=query,
+                source="fallback",
+                error=(
+                    "OPA CLI not available; install opa for policy evaluation: "
+                    "https://www.openpolicyagent.org/docs/latest/#running-opa"
+                ),
+            )
 
         return OPADecision(
             allowed=False,
@@ -211,7 +222,7 @@ class OPAEvaluator:
         """Run `opa eval` subprocess."""
         input_json = json.dumps(input_data)
 
-        cmd = ["opa", "eval", "--format", "json", "--input", "/dev/stdin", "--data"]
+        cmd = ["opa", "eval", "--format", "json", "--v0-compatible", "--input", "/dev/stdin", "--data"]
 
         if self.rego_path:
             cmd.append(self.rego_path)
@@ -258,15 +269,13 @@ class OPAEvaluator:
                 allowed=False, query=query, source="local", error="opa eval timed out"
             )
 
-    def _evaluate_builtin(self, query: str, input_data: dict) -> OPADecision:
-        """
-        Built-in simple Rego evaluator for common patterns.
+    def _evaluate_mock(self, query: str, input_data: dict) -> OPADecision:
+        """Mock Rego evaluator for testing/dev only.
 
-        Supports:
-        - default allow = false
-        - allow { input.role == "admin" }
-        - deny { input.action == "delete" }
-        - allow { not input.pii }
+        Supports only simple ``==``, ``!=``, and ``not`` conditions.
+        Does NOT support comprehensions, set operations, function calls,
+        builtins, virtual documents, or any non-trivial Rego feature.
+        Use a real OPA server or CLI for production.
         """
         if not self.rego_content:
             return OPADecision(allowed=False, query=query, source="fallback", error="No rego content")
@@ -367,6 +376,65 @@ class OPAEvaluator:
 
 
 # ── Integration with PolicyEngine ─────────────────────────────────
+
+
+class OPAPolicyBackend:
+    """Adapter wrapping OPAEvaluator to satisfy ExternalPolicyBackend protocol.
+
+    Usage:
+        from agentmesh.governance.opa import OPAPolicyBackend
+        from agentmesh.governance.backend import BackendRegistry
+
+        backend = OPAPolicyBackend(rego_content=MY_REGO)
+        BackendRegistry.register(backend)
+    """
+
+    def __init__(
+        self,
+        evaluator: Optional["OPAEvaluator"] = None,
+        query_prefix: str = "data.agentmesh.allow",
+        **kwargs: Any,
+    ):
+        """Initialize the OPA policy backend.
+
+        Args:
+            evaluator: An existing OPAEvaluator instance. If not provided,
+                one is created from the remaining keyword arguments.
+            query_prefix: Default Rego query path used when evaluate() is called.
+            **kwargs: Passed to OPAEvaluator constructor if evaluator is None.
+        """
+        self._evaluator = evaluator or OPAEvaluator(**kwargs)
+        self._query_prefix = query_prefix
+
+    @property
+    def name(self) -> str:
+        return "opa"
+
+    def evaluate(self, action: str, context: dict) -> "PolicyDecisionResult":
+        from agentmesh.governance.backend import PolicyDecisionResult
+
+        decision = self._evaluator.evaluate(self._query_prefix, context)
+        return PolicyDecisionResult(
+            allowed=decision.allowed,
+            reason=decision.error or ("allowed" if decision.allowed else "denied by policy"),
+            backend="opa",
+            latency_ms=decision.evaluation_ms,
+            raw_response=decision.raw_result,
+        )
+
+    def healthy(self) -> bool:
+        if self._evaluator.mode == "remote":
+            try:
+                import urllib.request
+                req = urllib.request.Request(
+                    f"{self._evaluator.opa_url}/health",
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=2) as resp:  # noqa: S310
+                    return resp.status == 200
+            except Exception:
+                return False
+        return self._evaluator._opa_available or self._evaluator.rego_content is not None
 
 
 def load_rego_into_engine(engine: Any, rego_path: str, package: str = "agentmesh") -> OPAEvaluator:

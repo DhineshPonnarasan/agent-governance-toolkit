@@ -1,9 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
+# ruff: noqa: E402 — deprecation warning must fire before re-exports
 """Agent Sandbox — execution isolation for AI agents.
 
 Provides ``SandboxProvider``, the abstract base class for all sandbox
-backends, plus two built-in implementations:
+backends, plus three built-in implementations:
 
 * :class:`DockerSandboxProvider` — hardened Docker containers with
   policy-driven resource limits, tool/network proxies, and filesystem
@@ -12,8 +13,20 @@ backends, plus two built-in implementations:
   upstream `hyperlight-sandbox <https://github.com/hyperlight-dev/hyperlight-sandbox>`_
   project (CNCF Sandbox). Capability-bound tools and domains, with
   in-memory snapshots.
+* :class:`ACASandboxProvider` — Azure Container Apps (ACA)
+  managed sandbox sessions with host-side policy gating and Azure-side
+  egress allowlist enforcement.
 """
 
+
+import warnings as _warnings
+_warnings.warn(
+    "agt-sandbox is deprecated. Use agent-governance-toolkit-cli instead. "
+    "See https://github.com/microsoft/agent-governance-toolkit/blob/main/docs/package-consolidation/MIGRATION.md",
+    DeprecationWarning,
+    stacklevel=2,
+)
+del _warnings
 from importlib.metadata import PackageNotFoundError, version
 
 from agent_sandbox.sandbox_provider import (
@@ -55,13 +68,21 @@ except ImportError:
     SnapshotHandle = None  # type: ignore[assignment,misc]
     hyperlight_config_from_policy = None  # type: ignore[assignment]
 
+# Lazy import: ACASandboxProvider requires the optional
+# ``azure-sandbox`` (and optionally ``azure-mgmt-sandbox``) SDKs.
 try:
-    __version__ = version("agent-sandbox")
+    from agent_sandbox.aca_sandbox_provider import ACASandboxProvider
+except ImportError:
+    ACASandboxProvider = None  # type: ignore[assignment,misc]
+
+try:
+    __version__ = version("agt-sandbox")
 except PackageNotFoundError:
     __version__ = "0.0.0"
 __author__ = "Microsoft Corporation"
 
 __all__ = [
+    "ACASandboxProvider",
     "DockerSandboxProvider",
     "ExecutionHandle",
     "ExecutionStatus",

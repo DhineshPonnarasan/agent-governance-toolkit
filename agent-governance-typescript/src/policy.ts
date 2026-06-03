@@ -16,8 +16,18 @@ import {
   PolicyScope,
   LegacyPolicyDecision,
 } from './types';
+import { extractProtocolFacets } from './protocol-facets';
 
 export type PolicyDecision = LegacyPolicyDecision;
+
+const VALID_POLICY_ACTIONS = new Set<string>(['allow', 'deny', 'warn', 'require_approval', 'log']);
+
+function asPolicyAction(value: unknown): PolicyAction | undefined {
+  if (typeof value === 'string' && VALID_POLICY_ACTIONS.has(value)) {
+    return value as PolicyAction;
+  }
+  return undefined;
+}
 
 // ΓöÇΓöÇ Conflict Resolution ΓöÇΓöÇ
 
@@ -153,6 +163,41 @@ function getNestedValue(obj: Record<string, unknown>, path: string): unknown {
 }
 
 /**
+ * Split `expr` on the literal separator `sep` only at positions that are
+ * outside of single- or double-quoted string literals. A naive
+ * `String.split(' or ')` mis-splits expressions like
+ * `name == 'foo or bar'` because the operator substring also appears inside
+ * the string literal; this helper walks the expression once, tracking quote
+ * state, and only treats separator occurrences outside quotes as boundaries.
+ * If no out-of-quote occurrence is found, the result has length 1 and the
+ * caller falls through to the comparison-operator branches.
+ */
+function splitOutsideQuotes(expr: string, sep: string): string[] {
+  const parts: string[] = [];
+  let start = 0;
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i <= expr.length - sep.length; i++) {
+    const ch = expr[i];
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+    if (!inSingle && !inDouble && expr.startsWith(sep, i)) {
+      parts.push(expr.slice(start, i));
+      start = i + sep.length;
+      i += sep.length - 1;
+    }
+  }
+  parts.push(expr.slice(start));
+  return parts;
+}
+
+/**
  * Evaluate a condition expression string against a context dictionary.
  * Supports: equality, inequality, numeric comparisons, `in` operator,
  * boolean attributes, and compound `and`/`or`.
@@ -160,16 +205,17 @@ function getNestedValue(obj: Record<string, unknown>, path: string): unknown {
 function evaluateExpression(expr: string, context: Record<string, unknown>): boolean {
   const trimmed = expr.trim();
 
-  // OR conditions (lowest precedence)
-  if (trimmed.includes(' or ')) {
-    const parts = trimmed.split(' or ');
-    return parts.some((p) => evaluateExpression(p.trim(), context));
+  // OR conditions (lowest precedence) — only split on out-of-quote separators
+  // so `name == 'foo or bar'` is not mis-tokenised.
+  const orParts = splitOutsideQuotes(trimmed, ' or ');
+  if (orParts.length > 1) {
+    return orParts.some((p) => evaluateExpression(p.trim(), context));
   }
 
-  // AND conditions
-  if (trimmed.includes(' and ')) {
-    const parts = trimmed.split(' and ');
-    return parts.every((p) => evaluateExpression(p.trim(), context));
+  // AND conditions — same out-of-quote split.
+  const andParts = splitOutsideQuotes(trimmed, ' and ');
+  if (andParts.length > 1) {
+    return andParts.every((p) => evaluateExpression(p.trim(), context));
   }
 
   // NOT IN: path not in ['a', 'b']
@@ -350,7 +396,7 @@ export class PolicyEngine {
   loadYaml(yamlContent: string): Policy {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const yaml = require('js-yaml');
-    const data = yaml.load(yamlContent) as Record<string, unknown>;
+    const data = yaml.load(yamlContent, { schema: yaml.JSON_SCHEMA }) as Record<string, unknown>;
     const policy = dataToPolicy(data);
     this.loadPolicy(policy);
     return policy;
@@ -404,6 +450,20 @@ export class PolicyEngine {
   evaluatePolicy(agentDid: string, context: Record<string, unknown>): PolicyDecisionResult {
     const start = performance.now();
 
+    // Enrich a defensive copy of the context with wire-protocol facets
+    // (sql.*, k8s.*, etc.) so policy rules can reference protocol-level
+    // semantics. We never mutate the caller's outer dict; FacetRegistry
+    // also replaces sub-object slots with merged copies so caller-owned
+    // sub-objects are untouched. Failures inside individual extractors
+    // are swallowed and logged so a broken parser cannot block
+    // evaluation.
+    const evalContext: Record<string, unknown> = { ...context };
+    try {
+      extractProtocolFacets(evalContext);
+    } catch {
+      // Defensive: the registry already swallows per-extractor errors.
+    }
+
     const applicable = [...this._policies.values()].filter((p) =>
       policyAppliesTo(p, agentDid),
     );
@@ -421,8 +481,8 @@ export class PolicyEngine {
 
         for (const rule of policy.rules) {
           if (rule.enabled === false) continue;
-          const ruleAction = rule.ruleAction ?? (rule.effect as PolicyAction | undefined) ?? 'deny';
-          if (evaluateRuleCondition(rule, context)) {
+          const ruleAction = rule.ruleAction ?? asPolicyAction(rule.effect) ?? 'deny';
+          if (evaluateRuleCondition(rule, evalContext)) {
             candidates.push({
               action: ruleAction,
               priority: rule.priority ?? 0,
@@ -574,7 +634,7 @@ export class PolicyEngine {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
     const yaml = require('js-yaml');
     const content = readFileSync(yamlPath, 'utf-8');
-    const doc = yaml.load(content) as { rules?: PolicyRule[] };
+    const doc = yaml.load(content, { schema: yaml.JSON_SCHEMA }) as { rules?: PolicyRule[] };
     if (doc?.rules && Array.isArray(doc.rules)) {
       this._legacyRules.push(...doc.rules);
     }
@@ -585,12 +645,19 @@ export class PolicyEngine {
    * First match wins; default is 'deny'.
    */
   evaluate(action: string, context: Record<string, unknown> = {}): PolicyDecision {
+    // Enrich a defensive copy so the caller's dict is not mutated.
+    const evalContext: Record<string, unknown> = { ...context };
+    try {
+      extractProtocolFacets(evalContext);
+    } catch {
+      // Defensive: extractor failures must never block legacy evaluation.
+    }
     for (const rule of this._legacyRules) {
       if (
         this.matchAction(rule.action ?? '', action) &&
         this.matchLegacyConditions(
           (rule.condition ?? rule.conditions) as Record<string, unknown> | undefined,
-          context,
+          evalContext,
         )
       ) {
         return (rule.effect ?? 'deny') as PolicyDecision;
@@ -759,7 +826,7 @@ function dataToPolicy(data: Record<string, unknown>): Policy {
         condition: r.condition as string | Record<string, unknown> | undefined,
         action: r.action as string | undefined,
         effect: r.effect as LegacyPolicyDecision | undefined,
-        ruleAction: r.ruleAction as PolicyAction | undefined,
+        ruleAction: asPolicyAction(r.ruleAction),
         limit: r.limit as string | undefined,
         approvers: r.approvers as string[] | undefined,
         priority: r.priority as number | undefined,

@@ -6,7 +6,7 @@ Build governance-aware AI agents in Go. The `agentmesh` module provides
 Ed25519 cryptographic identity, trust scoring, declarative policy evaluation,
 and hash-chain audit logging — all in a single `go get`.
 
-> **Target runtime:** Go 1.21+
+> **Target runtime:** Go 1.25+
 > **Module:** `github.com/microsoft/agent-governance-toolkit/agent-governance-golang`
 > **Package:** `agentmesh`
 
@@ -31,7 +31,7 @@ and hash-chain audit logging — all in a single `go get`.
 
 ## Prerequisites
 
-- **Go 1.21+**
+- **Go 1.25+**
 - Familiarity with Go modules (`go.mod`)
 - Recommended: read [Tutorial 01 — Policy Engine](01-policy-engine.md) for
   governance concepts
@@ -313,7 +313,9 @@ if err != nil {
 fmt.Println(engine.Evaluate("data.read", nil))  // allow
 ```
 
-Rules loaded from YAML are appended to any existing rules.
+`LoadFromYAML` replaces the engine's existing rule set; calling it again on a
+config reload won't double the rules. Use `MergeFromYAML` when composing rules
+from multiple files.
 
 ---
 

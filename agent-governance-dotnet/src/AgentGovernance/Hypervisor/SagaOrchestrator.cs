@@ -69,8 +69,12 @@ public sealed class SagaStep
     public int MaxAttempts { get => _maxAttempts; init => _maxAttempts = value; }
 
     /// <summary>
-    /// Obsolete: use <see cref="MaxAttempts"/> instead. This property controlled total
-    /// attempts (not retry count), which was confusing. It now maps to <see cref="MaxAttempts"/>.
+    /// Obsolete: use <see cref="MaxAttempts"/> instead.
+    /// This legacy property is preserved for backward compatibility and maps 1:1
+    /// to total attempts (including the first try), not retry count.
+    ///
+    /// Migration: replace <c>MaxRetries = N</c> with <c>MaxAttempts = N</c> for the
+    /// same runtime behavior.
     /// </summary>
     [Obsolete("Use MaxAttempts instead. MaxRetries controlled total attempts, not retry count.")]
     public int MaxRetries { get => _maxAttempts; init => _maxAttempts = value; }
@@ -205,9 +209,9 @@ public sealed class SagaOrchestrator
             {
                 lock (saga.SyncRoot) { step.Error = $"Step '{step.ActionId}' timed out after {step.Timeout.TotalSeconds}s."; }
             }
-            catch (Exception ex)
+            catch (Exception)
             {
-                lock (saga.SyncRoot) { step.Error = $"Step '{step.ActionId}' failed: {ex.Message}"; }
+                lock (saga.SyncRoot) { step.Error = $"Step '{step.ActionId}' failed — see server logs"; }
             }
 
             // Stop retrying if the caller cancelled the operation
@@ -253,12 +257,12 @@ public sealed class SagaOrchestrator
                 await step.Compensate(cts.Token).ConfigureAwait(false);
                 lock (saga.SyncRoot) { step.State = StepState.Compensated; }
             }
-            catch (Exception ex)
+            catch (Exception)
             {
                 lock (saga.SyncRoot)
                 {
                     step.State = StepState.CompensationFailed;
-                    step.Error = $"Compensation for '{step.ActionId}' failed: {ex.Message}";
+                    step.Error = $"Compensation for '{step.ActionId}' failed — see server logs";
                     saga.FailedCompensations.Add(step.ActionId);
                 }
             }

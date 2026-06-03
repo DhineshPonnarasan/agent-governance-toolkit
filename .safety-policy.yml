@@ -1,0 +1,9 @@
+# Safety CLI policy file (v2.0 for safety check compatibility)
+# safety check (legacy) only supports policy versions <= 2.0.
+# The CI workflow handles severity filtering in its own logic.
+version: "2.0"
+security:
+  ignore-cvss-severity-below: 0
+  ignore-cvss-unknown-severity: false
+  ignore-vulnerabilities: {}
+  continue-on-vulnerability-error: true

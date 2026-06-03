@@ -6,7 +6,7 @@ Capability Scoping
 Simple string-based capability scope checking.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 from pydantic import BaseModel, Field
 import uuid
@@ -47,7 +47,7 @@ class CapabilityGrant(BaseModel):
     )
 
     # Timing
-    granted_at: datetime = Field(default_factory=datetime.utcnow)
+    granted_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     expires_at: Optional[datetime] = Field(None)
 
     # Status
@@ -94,7 +94,7 @@ class CapabilityGrant(BaseModel):
         """Check if the grant is currently active and not expired."""
         if not self.active:
             return False
-        if self.expires_at and datetime.utcnow() > self.expires_at:
+        if self.expires_at and datetime.now(timezone.utc) > self.expires_at:
             return False
         return True
 
@@ -121,8 +121,15 @@ class CapabilityGrant(BaseModel):
         elif self.capability == requested:
             pass
         else:
-            # Fall back to component matching
-            req_action, req_resource, req_qualifier = self.parse_capability(requested)
+            # Fall back to component matching. parse_capability raises
+            # ValueError on inputs that don't contain a colon (e.g.
+            # bare verbs like "read") — fail-closed for those rather
+            # than crashing the caller. The grant simply doesn't match
+            # a malformed request.
+            try:
+                req_action, req_resource, req_qualifier = self.parse_capability(requested)
+            except ValueError:
+                return False
             if self.action != "*" and self.action != req_action:
                 return False
             if self.resource != "*" and self.resource != req_resource:
@@ -141,7 +148,7 @@ class CapabilityGrant(BaseModel):
     def revoke(self) -> None:
         """Revoke this grant immediately."""
         self.active = False
-        self.revoked_at = datetime.utcnow()
+        self.revoked_at = datetime.now(timezone.utc)
 
 
 class CapabilityScope(BaseModel):
@@ -310,6 +317,7 @@ class CapabilityRegistry:
         to_agent: str,
         from_agent: str,
         resource_ids: Optional[list[str]] = None,
+        require_grantor_capability: bool = False,
     ) -> CapabilityGrant:
         """Grant a capability to an agent.
 
@@ -322,10 +330,35 @@ class CapabilityRegistry:
             from_agent: DID of the agent issuing the grant.
             resource_ids: Optional specific resource IDs to scope the
                 grant to.
+            require_grantor_capability: When ``True``, verify that
+                ``from_agent`` already holds ``capability`` (i.e. can
+                actually delegate it). Bootstrap/admin grants set this
+                to ``False``. Callers that accept grants over the
+                network MUST set this to ``True`` to prevent privilege
+                escalation via unauthenticated grantor claims.
+
+        Raises:
+            PermissionError: If ``require_grantor_capability`` is
+                ``True`` and ``from_agent`` does not hold the
+                requested capability.
+            ValueError: If ``from_agent == to_agent`` (self-grant) or
+                the capability string is malformed.
 
         Returns:
             The newly created ``CapabilityGrant``.
         """
+        if from_agent == to_agent:
+            # Self-grants are meaningless and would bypass delegation
+            # checks (an agent could "grant" itself any capability).
+            raise ValueError("Cannot self-grant a capability")
+
+        if require_grantor_capability:
+            grantor_scope = self._scopes.get(from_agent)
+            if grantor_scope is None or not grantor_scope.has_capability(capability):
+                raise PermissionError(
+                    f"Grantor {from_agent} does not hold capability {capability!r}"
+                )
+
         grant = CapabilityGrant.create(
             capability=capability,
             granted_to=to_agent,

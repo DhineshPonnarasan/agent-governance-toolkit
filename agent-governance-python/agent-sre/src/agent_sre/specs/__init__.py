@@ -28,8 +28,8 @@ try:
 except ImportError:
     _HAS_YAML = False
 
-# specs/ directory is at the repo root, not inside the package
-_SPECS_DIR = Path(__file__).resolve().parent.parent.parent.parent / "specs"
+# specs/ YAML files live alongside this __init__.py inside the package
+_SPECS_DIR = Path(__file__).resolve().parent
 
 
 def _parse_value(val: str) -> Any:
@@ -169,7 +169,12 @@ def load_slo_template(
         Dict with keys: name, description, labels, indicators, error_budget
     """
     d = Path(specs_dir) if specs_dir else _SPECS_DIR
+    # Reject path traversal in template name
+    if "/" in name or "\\" in name or ".." in name:
+        raise ValueError(f"Invalid template name: {name!r}")
     path = d / f"{name}.yaml"
+    if not path.resolve().parent == d.resolve():
+        raise ValueError(f"Path traversal detected in template name: {name!r}")
     if not path.exists():
         available = list_templates(specs_dir)
         raise FileNotFoundError(
