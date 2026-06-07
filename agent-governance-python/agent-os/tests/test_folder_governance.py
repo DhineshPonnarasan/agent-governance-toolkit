@@ -361,3 +361,180 @@ class TestFolderScopedEvaluator:
         # No 'path' in context — falls back to flat
         result = evaluator.evaluate({"tool_name": "x"})
         assert not result.allowed
+
+
+# =============================================================================
+# Regression tests for #2861 — folder-scoped backend decisions must produce
+# the same audit_entry schema as the flat-path backend branch.
+# =============================================================================
+
+
+class TestFolderScopedBackendAudit:
+    """#2861 — folder-scoped backend decisions must include backend
+    metadata, evaluation_ms, and context_snapshot in audit_entry, matching
+    the flat-path backend branch."""
+
+    OPA_ALLOW_REGO = """
+package agentos
+default allow = false
+allow { input.tool_name == "web_search" }
+"""
+
+    OPA_DENY_REGO = """
+package agentos
+default allow = false
+"""
+
+    CEDAR_PERMIT = """
+permit(principal, action == Action::"WebSearch", resource);
+"""
+
+    CEDAR_FORBID = """
+forbid(principal, action == Action::"WebSearch", resource);
+"""
+
+    def test_scoped_opa_backend_allow_audit_entry(self, tmp_path):
+        _write_policy(tmp_path / "governance.yaml", _make_policy("root", [
+            _make_rule("block-shell", "shell_exec", priority=1000),
+        ]))
+        action = tmp_path / "src" / "agent.py"
+        action.parent.mkdir(parents=True, exist_ok=True)
+        action.touch()
+
+        evaluator = PolicyEvaluator(root_dir=tmp_path)
+        evaluator.load_rego(rego_content=self.OPA_ALLOW_REGO, mode="builtin")
+        decision = evaluator.evaluate(
+            {"tool_name": "web_search", "path": str(action)}
+        )
+        assert decision.allowed is True
+        ae = decision.audit_entry
+        assert ae, "Backend-originated scoped decision must include audit_entry"
+        assert ae["policy"] == "external:opa"
+        assert ae["rule"] is None
+        assert ae["action"] == "allow"
+        assert ae["backend"] == "opa"
+        assert "evaluation_ms" in ae
+        assert ae["context_snapshot"] == {
+            "tool_name": "web_search",
+            "path": str(action),
+        }
+        assert "timestamp" in ae
+
+    def test_scoped_opa_backend_deny_audit_entry(self, tmp_path):
+        _write_policy(tmp_path / "governance.yaml", _make_policy("root", []))
+        action = tmp_path / "src" / "agent.py"
+        action.parent.mkdir(parents=True, exist_ok=True)
+        action.touch()
+
+        evaluator = PolicyEvaluator(root_dir=tmp_path)
+        evaluator.load_rego(rego_content=self.OPA_DENY_REGO, mode="builtin")
+        decision = evaluator.evaluate(
+            {"tool_name": "file_read", "path": str(action)}
+        )
+        assert decision.allowed is False
+        ae = decision.audit_entry
+        assert ae["policy"] == "external:opa"
+        assert ae["backend"] == "opa"
+        assert ae["action"] == "deny"
+        assert "evaluation_ms" in ae
+        assert "context_snapshot" in ae
+        assert "timestamp" in ae
+
+    def test_scoped_cedar_backend_audit_entry(self, tmp_path):
+        _write_policy(tmp_path / "governance.yaml", _make_policy("root", []))
+        action = tmp_path / "src" / "agent.py"
+        action.parent.mkdir(parents=True, exist_ok=True)
+        action.touch()
+
+        evaluator = PolicyEvaluator(root_dir=tmp_path)
+        evaluator.load_cedar(policy_content=self.CEDAR_PERMIT, mode="builtin")
+        decision = evaluator.evaluate(
+            {"tool_name": "web_search", "path": str(action)}
+        )
+        assert decision.allowed is True
+        ae = decision.audit_entry
+        assert ae["policy"] == "external:cedar"
+        assert ae["backend"] == "cedar"
+        assert ae["action"] == "allow"
+        assert "evaluation_ms" in ae
+
+    def test_scoped_cedar_backend_forbid_audit_entry(self, tmp_path):
+        _write_policy(tmp_path / "governance.yaml", _make_policy("root", []))
+        action = tmp_path / "src" / "agent.py"
+        action.parent.mkdir(parents=True, exist_ok=True)
+        action.touch()
+
+        evaluator = PolicyEvaluator(root_dir=tmp_path)
+        evaluator.load_cedar(policy_content=self.CEDAR_FORBID, mode="builtin")
+        decision = evaluator.evaluate(
+            {"tool_name": "web_search", "path": str(action)}
+        )
+        assert decision.allowed is False
+        ae = decision.audit_entry
+        assert ae["policy"] == "external:cedar"
+        assert ae["backend"] == "cedar"
+        assert ae["action"] == "deny"
+        assert "evaluation_ms" in ae
+        assert "context_snapshot" in ae
+        assert "timestamp" in ae
+
+    def test_scoped_backend_evaluation_timing_present(self, tmp_path):
+        _write_policy(tmp_path / "governance.yaml", _make_policy("root", []))
+        action = tmp_path / "src" / "agent.py"
+        action.parent.mkdir(parents=True, exist_ok=True)
+        action.touch()
+
+        evaluator = PolicyEvaluator(root_dir=tmp_path)
+        evaluator.load_rego(rego_content=self.OPA_ALLOW_REGO, mode="builtin")
+        decision = evaluator.evaluate(
+            {"tool_name": "web_search", "path": str(action)}
+        )
+        # evaluation_ms is a non-negative number (BackendDecision field).
+        assert isinstance(decision.audit_entry["evaluation_ms"], (int, float))
+        assert decision.audit_entry["evaluation_ms"] >= 0
+
+    def test_flat_vs_scoped_backend_audit_entry_key_parity(self, tmp_path):
+        """Equivalent backend-originated decisions must produce equivalent
+        audit_entry key sets regardless of evaluation path."""
+        _write_policy(tmp_path / "governance.yaml", _make_policy("root", []))
+        action = tmp_path / "src" / "agent.py"
+        action.parent.mkdir(parents=True, exist_ok=True)
+        action.touch()
+
+        # Flat path — no root_dir, no 'path' in context.
+        flat_evaluator = PolicyEvaluator()
+        flat_evaluator.load_rego(rego_content=self.OPA_ALLOW_REGO, mode="builtin")
+        flat_decision = flat_evaluator.evaluate({"tool_name": "web_search"})
+
+        # Scoped path — root_dir set, 'path' in context.
+        scoped_evaluator = PolicyEvaluator(root_dir=tmp_path)
+        scoped_evaluator.load_rego(rego_content=self.OPA_ALLOW_REGO, mode="builtin")
+        scoped_decision = scoped_evaluator.evaluate(
+            {"tool_name": "web_search", "path": str(action)}
+        )
+
+        # The audit_entry key set must be identical between the two paths
+        # for the same logical backend decision.
+        assert set(flat_decision.audit_entry) == set(scoped_decision.audit_entry)
+
+    def test_scoped_backend_decision_preserves_allowed_and_action(self, tmp_path):
+        """The fix must not change authorization semantics: allowed, action,
+        matched_rule, and reason must be set correctly on scoped backend
+        decisions, identical to the pre-fix behavior."""
+        _write_policy(tmp_path / "governance.yaml", _make_policy("root", []))
+        action = tmp_path / "src" / "agent.py"
+        action.parent.mkdir(parents=True, exist_ok=True)
+        action.touch()
+
+        evaluator = PolicyEvaluator(root_dir=tmp_path)
+        evaluator.load_rego(rego_content=self.OPA_DENY_REGO, mode="builtin")
+        decision = evaluator.evaluate(
+            {"tool_name": "anything", "path": str(action)}
+        )
+        assert decision.allowed is False
+        assert decision.matched_rule is None
+        assert decision.action == "deny"
+        # The reason field is propagated from the BackendDecision.
+        assert decision.reason  # non-empty
+        # And audit_entry is now non-empty (the fix).
+        assert decision.audit_entry

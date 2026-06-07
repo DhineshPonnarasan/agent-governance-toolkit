@@ -305,6 +305,15 @@ class PolicyEvaluator:
                         matched_rule=None,
                         action=result.action,
                         reason=result.reason,
+                        audit_entry={
+                            "policy": f"external:{backend.name}",
+                            "rule": None,
+                            "action": result.action,
+                            "backend": backend.name,
+                            "evaluation_ms": result.evaluation_ms,
+                            "context_snapshot": context,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                        },
                     )
 
             # Defaults from most specific policy
