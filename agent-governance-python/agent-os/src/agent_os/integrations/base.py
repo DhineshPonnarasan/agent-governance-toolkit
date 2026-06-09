@@ -715,8 +715,8 @@ class TrustedSkillMetadataSource:
     Adapters must construct this only from framework metadata surfaces,
     never from user-controlled request payloads or tool arguments.
 
-    TODO: extend this with verifiable attestations/signatures when
-    framework runtimes expose portable trust claims.
+    Future: extend with verifiable attestations/signatures when framework
+    runtimes expose portable trust claims. Tracked in #2907.
     """
 
     skill_name: str | None = None
