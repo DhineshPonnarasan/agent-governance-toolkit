@@ -438,7 +438,7 @@ jobs:
           fi
       - name: Upload coverage
         if: steps.gate.outputs.run == 'true'
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354 # v6.0.1
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v7.0.0
         with:
           files: agent-governance-python/${{ matrix.package }}/coverage.xml
           flags: ${{ matrix.package }}
@@ -616,7 +616,7 @@ jobs:
             --verbose 2>/dev/null || echo "BinSkim completed with warnings"
       - name: Upload BinSkim SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@87557b9c84dde89fdd9b10e88954ac2f4248e463 # v4.36.1
+        uses: github/codeql-action/upload-sarif@8aad20d150bbac5944a9f9d289da16a4b0d87c1e # v4.36.2
         with:
           sarif_file: agent-governance-dotnet/binskim-results.sarif
           category: binskim
@@ -919,7 +919,12 @@ jobs:
       - name: Install dependencies
         if: steps.gate.outputs.run == 'true'
         working-directory: ${{ matrix.path }}
-        run: npm ci --legacy-peer-deps --ignore-scripts  # Scorecard: uses lockfile via npm ci
+        run: |
+          if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ]; then
+            npm ci --legacy-peer-deps --ignore-scripts  # Scorecard: uses lockfile via npm ci
+          else
+            npm install --legacy-peer-deps --ignore-scripts
+          fi
       - name: Check Claude Code marketplace version
         if: steps.gate.outputs.run == 'true' && matrix.name == 'agent-governance-claude-code'
         run: node scripts/sync-claude-marketplace-version.mjs --check
