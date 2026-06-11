@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agentmesh_platform"
-version = "4.0.0"
+version = "4.1.0"
 description = "Deprecated — use agent-governance-toolkit-core instead. The Secure Nervous System for Cloud-Native Agent Ecosystems"
 readme = "README.md"
 license = {text = "MIT"}
@@ -54,7 +54,7 @@ dependencies = [
     "httpx>=0.27.0,<1.0",
     "aiohttp>=3.13.4,<4.0",
     "pyyaml>=6.0,<7.0",
-    "structlog>=24.1.0,<26.0",
+    "structlog>=24.1.0,<27.0",
     "click>=8.4.1,<9.0",
     "rich>=13.0.0,<16.0",
     "python-dateutil>=2.8.0,<3.0",
