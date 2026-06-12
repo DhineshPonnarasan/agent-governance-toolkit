@@ -146,9 +146,11 @@ Boundary semantics:
 
 When a rule with dynamic condition is evaluated, audit metadata SHOULD include:
 
-- `dynamic_condition` (serialized condition config)
-- `runtime_snapshot` (provided runtime context)
+- `dynamic_condition` (serialized condition config) — always present when the rule has a `dynamic_condition`.
+- `evaluated_budget` — present only for budget conditions (`token_count_per_window`, `cost_per_window`). Records a minimal summary of the budget check: `{metric, window, limit, amount}`. No other fields from `dynamic_context` are recorded.
 - existing static context snapshot and timestamp fields
+
+The full `dynamic_context` provided to `PolicyEvaluator.evaluate` is intentionally NOT persisted in audit entries. Hosts that need the full runtime context should record it at a layer that has its own redaction policy.
 
 ## 5. Failure Semantics
 
