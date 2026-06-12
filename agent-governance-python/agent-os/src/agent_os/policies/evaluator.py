@@ -392,6 +392,14 @@ class PolicyEvaluator:
                 allowed=False,
                 action="deny",
                 reason="Policy evaluation error — access denied (fail closed)",
+                audit_entry={
+                    "policy": None,
+                    "rule": None,
+                    "action": "deny",
+                    "context_snapshot": copy.deepcopy(context),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "error": True,
+                },
             )
 
 

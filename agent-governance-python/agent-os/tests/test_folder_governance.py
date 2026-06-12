@@ -580,3 +580,143 @@ permit(principal, action == Action::"WebSearch", resource);
         snap_list = decision.audit_entry["context_snapshot"]["agent_groups"]
         assert snap_list == ["users", "analysts"]
         assert "admins" not in snap_list
+
+
+# =============================================================================
+# Regression tests for #2872 — folder-scoped fail-closed decisions must
+# produce the same audit_entry schema as the flat fail-closed branch.
+# =============================================================================
+
+
+class _RaisingBackend:
+    """Test double: raises on every evaluate() call to force the
+    except-Exception fail-closed path in PolicyEvaluator."""
+
+    name = "raising"
+
+    def evaluate(self, context):  # noqa: ARG002
+        raise RuntimeError("forced backend failure for fail-closed test")
+
+
+class TestFailClosedAuditParity:
+    """#2872 — fail-closed decisions must produce equivalent audit_entry
+    enrichment regardless of whether evaluation occurred through the
+    flat path or the folder-scoped path. The flat fail-closed branch
+    emits {policy, rule, action, context_snapshot, timestamp, error}
+    including the `error: True` indicator. The folder-scoped branch
+    must do the same."""
+
+    def test_flat_fail_closed_audit_entry_shape(self):
+        """Flat fail-closed path: audit_entry is populated with the
+        expected fail-closed schema, including the `error: True` flag."""
+        evaluator = PolicyEvaluator()
+        evaluator._backends.append(_RaisingBackend())
+        decision = evaluator.evaluate({"tool_name": "anything"})
+        assert decision.allowed is False
+        assert decision.action == "deny"
+        assert "fail closed" in decision.reason.lower()
+
+        ae = decision.audit_entry
+        assert ae["policy"] is None
+        assert ae["rule"] is None
+        assert ae["action"] == "deny"
+        assert ae["error"] is True
+        assert "context_snapshot" in ae
+        assert "timestamp" in ae
+        # Context snapshot is the caller's context (deep-copied).
+        assert ae["context_snapshot"]["tool_name"] == "anything"
+
+    def test_scoped_fail_closed_audit_entry_shape(self, tmp_path):
+        """Folder-scoped fail-closed path: same audit_entry schema as
+        the flat fail-closed path. Pre-fix this returned an empty dict
+        because the scoped except-block did not pass audit_entry at
+        all (Field(default_factory=dict) -> {})."""
+        _write_policy(tmp_path / "governance.yaml", _make_policy("root", []))
+        action = tmp_path / "src" / "agent.py"
+        action.parent.mkdir(parents=True, exist_ok=True)
+        action.touch()
+
+        evaluator = PolicyEvaluator(root_dir=tmp_path)
+        evaluator._backends.append(_RaisingBackend())
+        decision = evaluator.evaluate(
+            {"tool_name": "web_search", "path": str(action)}
+        )
+        assert decision.allowed is False
+        assert decision.action == "deny"
+        assert "fail closed" in decision.reason.lower()
+
+        ae = decision.audit_entry
+        # Pre-fix these keys were missing entirely; post-fix they are present.
+        assert "error" in ae, (
+            "Scoped fail-closed must include the `error: True` flag "
+            "to match the flat fail-closed audit shape"
+        )
+        assert ae["error"] is True
+        assert ae["policy"] is None
+        assert ae["rule"] is None
+        assert ae["action"] == "deny"
+        assert "context_snapshot" in ae
+        assert "timestamp" in ae
+        assert ae["context_snapshot"]["tool_name"] == "web_search"
+        assert ae["context_snapshot"]["path"] == str(action)
+
+    def test_flat_and_scoped_fail_closed_have_key_set_parity(self, tmp_path):
+        """The invariant the issue requests: equivalent fail-closed
+        decisions must produce equivalent audit_entry key sets,
+        regardless of evaluation path. Key-set equality is
+        refactor-resilient — adding a new key to both paths in the
+        future keeps parity; adding to only one breaks parity."""
+        _write_policy(tmp_path / "governance.yaml", _make_policy("root", []))
+        action = tmp_path / "src" / "agent.py"
+        action.parent.mkdir(parents=True, exist_ok=True)
+        action.touch()
+
+        # Flat path: no root_dir, no 'path' in context.
+        flat_evaluator = PolicyEvaluator()
+        flat_evaluator._backends.append(_RaisingBackend())
+        flat_decision = flat_evaluator.evaluate({"tool_name": "web_search"})
+
+        # Folder-scoped path: root_dir set, 'path' in context.
+        scoped_evaluator = PolicyEvaluator(root_dir=tmp_path)
+        scoped_evaluator._backends.append(_RaisingBackend())
+        scoped_decision = scoped_evaluator.evaluate(
+            {"tool_name": "web_search", "path": str(action)}
+        )
+
+        # Core fail-closed invariants: equivalent decisions.
+        assert flat_decision.allowed is False
+        assert scoped_decision.allowed is False
+        assert flat_decision.action == scoped_decision.action == "deny"
+
+        # Audit-entry key-set parity (the issue's core invariant).
+        assert set(flat_decision.audit_entry) == set(scoped_decision.audit_entry), (
+            f"Flat keys {sorted(flat_decision.audit_entry)} != "
+            f"scoped keys {sorted(scoped_decision.audit_entry)}"
+        )
+
+    def test_scoped_fail_closed_snapshot_is_deep_copy(self, tmp_path):
+        """The fail-closed audit_entry must also deep-copy context, just
+        like every other audit_entry construction site. This combines
+        the #2872 (parity) and #2863 review (deep-copy) guarantees."""
+        _write_policy(tmp_path / "governance.yaml", _make_policy("root", []))
+        action = tmp_path / "src" / "agent.py"
+        action.parent.mkdir(parents=True, exist_ok=True)
+        action.touch()
+
+        evaluator = PolicyEvaluator(root_dir=tmp_path)
+        evaluator._backends.append(_RaisingBackend())
+        context: dict = {
+            "tool_name": "web_search",
+            "path": str(action),
+            "tool_args": {"table": "users"},
+        }
+        decision = evaluator.evaluate(context)
+        assert decision.allowed is False
+
+        snap = decision.audit_entry["context_snapshot"]
+        assert snap is not context
+        assert snap["tool_args"] is not context["tool_args"]
+
+        # Mutate after the call; snapshot must be unaffected.
+        context["tool_args"]["table"] = "audit_log"
+        assert snap["tool_args"]["table"] == "users"
