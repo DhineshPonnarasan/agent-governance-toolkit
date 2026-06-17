@@ -820,3 +820,25 @@ unvalidated
 userinfo
 winres
 worktree
+
+# --- African regulatory policy terms ---
+POPIA
+popia
+NDPA
+ndpa
+NFIU
+nfiu
+CBN
+BVN
+NIN
+Anambra
+Kogi
+crossborder
+crossstate
+offence
+authorisation
+authorised
+geofencing
+geofence
+geomatch
+YYMMDDGSSSCAZ
