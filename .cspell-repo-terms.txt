@@ -1128,6 +1128,7 @@ tcpdump
 filterwarnings
 simplefilter
 subn
+recwarn
 
 # --- Azure credential pattern terms (used in credential_redactor regexes) ---
 accountkey
