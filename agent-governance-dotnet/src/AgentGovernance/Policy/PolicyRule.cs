@@ -349,8 +349,11 @@ public sealed class PolicyRule
                 result = d;
                 return true;
             case float f:
-                result = f;
-                return true;
+                return double.TryParse(
+                    f.ToString(CultureInfo.InvariantCulture),
+                    NumberStyles.Float,
+                    CultureInfo.InvariantCulture,
+                    out result);
             case decimal m:
                 result = (double)m;
                 return true;

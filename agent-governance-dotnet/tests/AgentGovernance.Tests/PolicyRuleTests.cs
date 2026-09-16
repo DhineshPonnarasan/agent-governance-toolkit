@@ -776,4 +776,32 @@ public class PolicyRuleTests
         var context = new Dictionary<string, object> { ["score"] = double.PositiveInfinity };
         Assert.True(rule.Evaluate(context));
     }
+
+    [Fact]
+    public void Evaluate_NumericEquality_FloatField_MatchesDecimal()
+    {
+        var rule = new PolicyRule
+        {
+            Name = "test-numeric-eq-float",
+            Condition = "score == 0.1",
+            Action = PolicyAction.Deny
+        };
+
+        var context = new Dictionary<string, object> { ["score"] = 0.1f };
+        Assert.True(rule.Evaluate(context));
+    }
+
+    [Fact]
+    public void Evaluate_NumericLessThanOrEqual_FloatField_MatchesBoundary()
+    {
+        var rule = new PolicyRule
+        {
+            Name = "test-numeric-lte-float",
+            Condition = "score <= 0.1",
+            Action = PolicyAction.Deny
+        };
+
+        var context = new Dictionary<string, object> { ["score"] = 0.1f };
+        Assert.True(rule.Evaluate(context));
+    }
 }
