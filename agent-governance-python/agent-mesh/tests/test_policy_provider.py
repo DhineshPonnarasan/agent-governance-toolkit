@@ -8,6 +8,7 @@ Covers:
 * ``PolicyProviderHandler.handle_policies`` — policy listing
 * ``to_asgi_app`` — raw ASGI protocol compliance
 * Error handling for malformed requests
+* Policy engine failures — errors, never decisions
 """
 
 from __future__ import annotations
@@ -50,10 +51,14 @@ class _StubDecision:
 def _make_engine(
     decision: _StubDecision | None = None,
     policies: list[str] | None = None,
+    engine_error: BaseException | None = None,
 ) -> MagicMock:
     """Create a mock policy engine."""
     engine = MagicMock(spec=[])
-    engine.evaluate = MagicMock(return_value=decision or _StubDecision())
+    if engine_error is not None:
+        engine.evaluate = MagicMock(side_effect=engine_error)
+    else:
+        engine.evaluate = MagicMock(return_value=decision or _StubDecision())
     engine.list_policies = MagicMock(return_value=policies or [])
     return engine
 
@@ -63,9 +68,10 @@ def _make_handler(
     policies: list[str] | None = None,
     trust_score: float | None = None,
     with_audit: bool = False,
+    engine_error: BaseException | None = None,
 ) -> PolicyProviderHandler:
     """Create a ``PolicyProviderHandler`` with mock dependencies."""
-    engine = _make_engine(decision, policies)
+    engine = _make_engine(decision, policies, engine_error)
 
     trust_mgr = None
     if trust_score is not None:
@@ -271,6 +277,18 @@ class TestAsgiApp:
         assert status == 400
         assert "error" in body
 
+    def test_check_non_object_json_returns_400(self):
+        """Valid JSON with the wrong shape is a client error, not an
+        evaluation failure: 400, and the engine must never run."""
+        handler = _make_handler()
+        app = handler.to_asgi_app()
+        status, body = asyncio.run(
+            _asgi_request(app, "POST", "/check", b"[1, 2]")
+        )
+        assert status == 400
+        assert body == {"error": "invalid request"}
+        handler.policy_engine.evaluate.assert_not_called()
+
     def test_not_found(self):
         handler = _make_handler()
         app = handler.to_asgi_app()
@@ -279,3 +297,77 @@ class TestAsgiApp:
         )
         assert status == 404
         assert "error" in body
+
+
+# =========================================================================
+# Engine failure tests
+# =========================================================================
+
+
+class TestEngineFailure:
+    """Tests for policy engine exceptions — failures are errors, not decisions."""
+
+    def test_handle_check_propagates_engine_exception(self):
+        """``handle_check`` has no failure channel: the exception must surface,
+        never be converted into an allow-shaped response."""
+        handler = _make_handler(engine_error=RuntimeError("backend down"))
+        with pytest.raises(RuntimeError, match="backend down"):
+            handler.handle_check(
+                {"agent_id": "agent-1", "action": "read", "context": {}}
+            )
+
+    def test_check_endpoint_returns_500_on_engine_failure(self):
+        handler = _make_handler(engine_error=RuntimeError("backend down"))
+        app = handler.to_asgi_app()
+        payload = json.dumps(
+            {"agent_id": "a1", "action": "read", "context": {}}
+        ).encode()
+        status, body = asyncio.run(
+            _asgi_request(app, "POST", "/check", payload)
+        )
+        assert status == 500
+        assert body == {"error": "policy evaluation failed"}
+
+    def test_engine_failure_has_no_decision_shape(self):
+        """A failure must not look like a denial: no allowed/decision keys."""
+        handler = _make_handler(engine_error=RuntimeError("boom"))
+        app = handler.to_asgi_app()
+        payload = json.dumps(
+            {"agent_id": "a1", "action": "read", "context": {}}
+        ).encode()
+        status, body = asyncio.run(
+            _asgi_request(app, "POST", "/check", payload)
+        )
+        assert status == 500
+        assert "allowed" not in body
+        assert "decision" not in body
+
+    def test_engine_failure_does_not_audit_a_decision(self):
+        """No decision exists on engine failure, so no audit record may be written."""
+        handler = _make_handler(
+            engine_error=RuntimeError("boom"), with_audit=True
+        )
+        app = handler.to_asgi_app()
+        payload = json.dumps(
+            {"agent_id": "a1", "action": "read", "context": {}}
+        ).encode()
+        status, _ = asyncio.run(
+            _asgi_request(app, "POST", "/check", payload)
+        )
+        assert status == 500
+        handler.audit_logger.log.assert_not_called()
+
+    def test_engine_failure_hides_exception_details(self):
+        """Internal exception details must not leak to the client."""
+        handler = _make_handler(
+            engine_error=RuntimeError("conn failed: password=hunter2")
+        )
+        app = handler.to_asgi_app()
+        payload = json.dumps(
+            {"agent_id": "a1", "action": "read", "context": {}}
+        ).encode()
+        status, body = asyncio.run(
+            _asgi_request(app, "POST", "/check", payload)
+        )
+        assert status == 500
+        assert "hunter2" not in json.dumps(body)

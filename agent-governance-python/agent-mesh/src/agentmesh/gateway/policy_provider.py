@@ -10,8 +10,11 @@ without a framework dependency.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 class PolicyProviderHandler:
@@ -27,6 +30,12 @@ class PolicyProviderHandler:
 
         Request: {"agent_id": "...", "action": "...", "context": {...}}
         Response: {"allowed": bool, "decision": "...", "reason": "...", "trust_score": float}
+
+        Engine exceptions propagate to the caller: a failure is not a
+        decision, so it is never converted into an allow or deny here.
+        The ASGI layer translates it into a 500 error response. Failures
+        produce no audit record, since no decision was reached; they are
+        logged server-side instead.
         """
         agent_id = request.get("agent_id", "")
         action = request.get("action", "")
@@ -104,8 +113,24 @@ class PolicyProviderHandler:
                 body = json.dumps({"error": "invalid JSON"}).encode()
                 status = 400
             else:
-                body = json.dumps(self.handle_check(request)).encode()
-                status = 200
+                # Valid JSON is not necessarily a valid check request:
+                # only an object has the agent_id/action/context fields.
+                if not isinstance(request, dict):
+                    body = json.dumps({"error": "invalid request"}).encode()
+                    status = 400
+                else:
+                    try:
+                        body = json.dumps(self.handle_check(request)).encode()
+                    except Exception:
+                        # Engine failure is not a decision: report a 500 with the
+                        # same {"error": ...} shape as the other error responses.
+                        # Diagnostics stay server-side via exc_info; the client
+                        # sees only a fixed message, and never an allow.
+                        logger.exception("Policy evaluation failed")
+                        body = json.dumps({"error": "policy evaluation failed"}).encode()
+                        status = 500
+                    else:
+                        status = 200
         else:
             body = json.dumps({"error": "not found"}).encode()
             status = 404
