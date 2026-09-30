@@ -33,9 +33,16 @@ class PolicyProviderHandler:
 
         Engine exceptions propagate to the caller: a failure is not a
         decision, so it is never converted into an allow or deny here.
-        The ASGI layer translates it into a 500 error response. Failures
-        produce no audit record, since no decision was reached; they are
-        logged server-side instead.
+        Direct callers of this method receive the evaluation exception
+        itself; the ASGI boundary is responsible for converting that
+        failure into a structured 503 error response.
+
+        Audit trade-off: because no decision was reached, no allow/deny
+        record is written to the decision audit stream. Recording a deny
+        would be misleading, so the failure is represented by server-side
+        exception logging instead. Callers that rely exclusively on
+        decision audit records will not see a record for a failed
+        evaluation.
         """
         agent_id = request.get("agent_id", "")
         action = request.get("action", "")
@@ -122,13 +129,16 @@ class PolicyProviderHandler:
                     try:
                         body = json.dumps(self.handle_check(request)).encode()
                     except Exception:
-                        # Engine failure is not a decision: report a 500 with the
+                        # Engine failure is not a decision: report a 503 with the
                         # same {"error": ...} shape as the other error responses.
-                        # Diagnostics stay server-side via exc_info; the client
-                        # sees only a fixed message, and never an allow.
+                        # 503 rather than 500 because unusable policy state is a
+                        # transient, retryable condition (consistent with
+                        # server/policy_server.py). Diagnostics stay server-side
+                        # via exc_info; the client sees only a fixed message,
+                        # and never an allow.
                         logger.exception("Policy evaluation failed")
                         body = json.dumps({"error": "policy evaluation failed"}).encode()
-                        status = 500
+                        status = 503
                     else:
                         status = 200
         else:
